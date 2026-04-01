@@ -440,6 +440,25 @@ let%test _ =
   Option.equal (=|=) (func {name = "";  index = 2})  (Some 2) &&
   Option.equal (=|=) (func {name = "";  index = 3})  (Some 3)
 
+let uses_implicit_receiver (fun_exp : IL.exp) =
+  match fun_exp.e with
+  | Fetch
+      {
+        base = (Var _ | VarSpecial ((Self | This), _));
+        rev_offset = { o = Dot _; _ } :: _;
+      } ->
+      true
+  | _ -> false
+
+let adjust_fparams_for_implicit_receiver (fun_exp : IL.exp)
+    (fparams : Signature.params) num_args =
+  match fparams with
+  | Signature.P ("self" | "cls" | "this") :: rest
+    when uses_implicit_receiver fun_exp
+         && Int.equal (List.length fparams) (num_args + 1) ->
+      rest
+  | _ -> fparams
+
 let combine_rest_args_exp (es : IL.exp list) : IL.exp =
   let e = IL.Composite (IL.CList, Tok.unsafe_fake_bracket es) in
   let eorig =
@@ -463,6 +482,10 @@ let combine_rest_args_exp (es : IL.exp list) : IL.exp =
 *)
 let instantiate_lval_using_actual_exps (fun_exp : IL.exp) fparams args_exps
     (tlval : T.lval) : (IL.name * T.offset list * T.tainted_token) option =
+  let fparams =
+    adjust_fparams_for_implicit_receiver fun_exp fparams
+      (List.length args_exps)
+  in
   (* Error handling  *)
   let log_error () =
     Log.err (fun m ->
@@ -633,6 +656,10 @@ let combine_rest_args_taint (ts : (Taints.t * shape) list) : Taints.t * shape =
 
 let instantiate_lval_using_shape lval_env fparams (fun_exp : IL.exp) args_taints
     lval : (Taints.t * shape) option =
+  let fparams =
+    adjust_fparams_for_implicit_receiver fun_exp fparams
+      (List.length args_taints)
+  in
   let { T.base; offset } = lval in
   let* base, offset =
     match base with

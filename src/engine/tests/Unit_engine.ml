@@ -612,6 +612,2609 @@ let filter_irrelevant_rules_tests () =
 (* Tainting tests *)
 (*****************************************************************************)
 
+let interfile_taint_tests () =
+  let write_interfile_rule rule_file =
+    UFile.write_file rule_file
+      {|rules:
+- id: interfile-python
+  languages:
+    - python
+  severity: ERROR
+  message: Interfile taint
+  mode: taint
+  options:
+    interfile: true
+  pattern-sources:
+    - pattern: tainted(...)
+  pattern-sinks:
+    - pattern: sink(...)
+|}
+  in
+  let parse_taint_rule rule_file =
+    match Parse_rule.parse rule_file |> Result.get_ok with
+    | [ ({ R.mode = `Taint _ as mode; _ } as rule) ] -> { rule with mode }
+    | _ -> Alcotest.fail "expected a single taint rule"
+  in
+  let mk_interfile_checker root files =
+    let _ = Domain.DLS.set cache (Hashtbl.create 101) in
+    let rule_file = root / "rule.yaml" in
+    write_interfile_rule rule_file;
+    let rule = parse_taint_rule rule_file in
+    let xlang = Xlang.of_lang Lang.Python in
+    let xtarget_of_file = Test_engine.xtarget_of_file xlang in
+    let xtargets = files |> List_.map xtarget_of_file in
+    let xconf =
+      {
+        Match_env.default_xconfig with
+        filter_irrelevant_rules = Match_env.PrefilterWithCache cache;
+      }
+    in
+    let interfile_context =
+      Match_tainting_mode.build_interfile_contexts xconf [ (rule, xtargets) ]
+    in
+    fun file ->
+      let xtarget = xtarget_of_file file in
+      Match_rules.check ~match_hook:(fun _pm -> ()) ~timeout:None
+        ~interfile_context xconf [ (rule :> R.rule) ] xtarget
+  in
+  let match_locations (check_file : Fpath.t -> Core_result.matches_single_file)
+      file =
+    let (res : Core_result.matches_single_file) = check_file file in
+    res.matches |> List_.map TCM.location_of_pm
+  in
+  let check_single_match ~name ~file ~line matches =
+    Alcotest.(check int) (spf "one finding for %s" name) 1 (List.length matches);
+    let actual_file, actual_line = List.hd matches in
+    Alcotest.(check bool) (spf "match is reported on %s" name) true
+      (Fpath.equal file actual_file);
+    Alcotest.(check int) (spf "match line is correct for %s" name) line
+      actual_line
+  in
+  let check_match_lines ~name ~file ~lines matches =
+    Alcotest.(check int)
+      (spf "expected number of findings for %s" name)
+      (List.length lines) (List.length matches);
+    let actual_lines =
+      matches
+      |> List_.map (fun (actual_file, actual_line) ->
+             Alcotest.(check bool) (spf "match is reported on %s" name) true
+               (Fpath.equal file actual_file);
+             actual_line)
+      |> List.sort compare
+    in
+    Alcotest.(check (list int)) (spf "match lines are correct for %s" name)
+      (List.sort compare lines) actual_lines
+  in
+  let check_no_matches ~name matches =
+    Alcotest.(check int) (spf "no findings for %s" name) 0 (List.length matches)
+  in
+  [
+    t "interfile taint across direct imported sources" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file app_file
+              {|from source import source
+
+def run():
+    sink(source())  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the direct imported source sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across imported module-level values" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import payload
+
+def run():
+    sink(payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the imported module-level value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across directly aliased imported module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import payload as imported_payload
+
+def run():
+    sink(imported_payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the directly aliased imported module-level value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint does not overtaint imported safe module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+safe_payload = "safe"
+|};
+            UFile.write_file app_file
+              {|from source import safe_payload
+
+def run():
+    sink(safe_payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the imported safe module-level value sink"
+              app_matches));
+    t "interfile taint across python imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helpers.py" in
+            let app_file = root / "app.py" in
+            let safe_app_file = root / "safe_app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file app_file
+              {|import helpers
+
+def run():
+    sink(helpers.helper())  # ruleid: interfile-python
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file safe_app_file
+              {|import helpers
+
+def run():
+    sink("safe")
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; helper_file; app_file; safe_app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            let safe_app_matches =
+              let res = check_file safe_app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool) "match is reported on the sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int) "match is reported on the sink line" 4
+              actual_line;
+            Alcotest.(check int) "no finding in safe file" 0
+              (List.length safe_app_matches)));
+    t "interfile taint across python package imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "src" / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from pkg.source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg.helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one package interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool) "match is reported on the package sink file"
+              true (Fpath.equal app_file actual_file);
+            Alcotest.(check int) "match is reported on the package sink line" 4
+              actual_line));
+    t "interfile taint across aliased module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import helper as helper_mod
+
+def run():
+    sink(helper_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one aliased module interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the aliased module sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the aliased module sink line" 4 actual_line));
+    t "interfile taint across aliased function imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper as run_helper
+
+def run():
+    sink(run_helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one aliased function interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the aliased function sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the aliased function sink line" 4
+              actual_line));
+    t "interfile taint across aliased upstream imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source as source_fn
+
+def helper():
+    return source_fn()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased upstream helper sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across python relative imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from .helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one relative import interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the relative import sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the relative import sink line" 4 actual_line));
+    t "interfile taint across python parent relative imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            let subpkg_dir = pkg_dir / "subpkg" in
+            UFile.make_directories subpkg_dir;
+            let pkg_init = pkg_dir / "__init__.py" in
+            let subpkg_init = subpkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = subpkg_dir / "helper.py" in
+            let app_file = subpkg_dir / "app.py" in
+            UFile.write_file pkg_init "";
+            UFile.write_file subpkg_init "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from ..source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from .helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ pkg_init; subpkg_init; source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int)
+              "one parent relative import interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the parent relative import sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the parent relative import sink line" 4
+              actual_line));
+    t "interfile taint across aliased relative function imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from .helper import helper as run_helper
+
+def run():
+    sink(run_helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased relative helper sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across package re-exports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .helper import helper
+|};
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one package re-export interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the package re-export sink file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the package re-export sink line" 4
+              actual_line));
+    t "interfile taint across package re-exported module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .source import payload
+|};
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from pkg import payload
+
+def run():
+    sink(payload)  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ init_file; source_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the package re-exported value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased package re-exported module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .source import payload as exported_payload
+|};
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from pkg import exported_payload
+
+def run():
+    sink(exported_payload)  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ init_file; source_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased package re-exported value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased symbol package re-exports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .helper import helper
+|};
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import pkg as pkg_mod
+
+def run():
+    sink(pkg_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased package re-export sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across package submodule imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg import helper
+
+def run():
+    sink(helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the package submodule sink" ~file:app_file
+              ~line:4 app_matches));
+    t "interfile taint across aliased package submodule imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg import helper as helper_mod
+
+def run():
+    sink(helper_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased package submodule sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased dotted package module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import pkg.helper as helper_mod
+
+def run():
+    sink(helper_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased dotted package module sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased package re-exports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .helper import helper as exported_helper
+|};
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg import exported_helper as run_helper
+
+def run():
+    sink(run_helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased package re-exported sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased dotted package symbol imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg.helper import helper as run_helper
+
+def run():
+    sink(run_helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased dotted package helper sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across imported class methods" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+class Helper:
+    @staticmethod
+    def helper():
+        return source()
+|};
+            UFile.write_file app_file
+              {|from helper import Helper
+
+def run():
+    sink(Helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int) "one imported method interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool) "match is reported on the imported method sink file"
+              true (Fpath.equal app_file actual_file);
+            Alcotest.(check int) "match is reported on the imported method sink line"
+              4 actual_line));
+    t "interfile taint across imported instance methods" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+class Helper:
+    def helper(self):
+        return source()
+|};
+            UFile.write_file app_file
+              {|from helper import Helper
+
+def run():
+    sink(Helper().helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int)
+              "one imported instance method interfile finding" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool)
+              "match is reported on the imported instance method sink file"
+              true (Fpath.equal app_file actual_file);
+            Alcotest.(check int)
+              "match is reported on the imported instance method sink line" 4
+              actual_line));
+    t "interfile taint across aliased imported instance methods" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+class Helper:
+    def helper(self):
+        return source()
+|};
+            UFile.write_file app_file
+              {|from helper import Helper as ImportedHelper
+
+def run():
+    sink(ImportedHelper().helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased imported instance-method sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased imported class methods" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+class Helper:
+    @staticmethod
+    def helper():
+        return source()
+|};
+            UFile.write_file app_file
+              {|from helper import Helper as ImportedHelper
+
+def run():
+    sink(ImportedHelper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased imported class-method sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across module-qualified imported class methods" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+class Helper:
+    @staticmethod
+    def helper():
+        return source()
+|};
+            UFile.write_file app_file
+              {|import helper
+
+def run():
+    sink(helper.Helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the module-qualified imported class-method sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint resolves the correct package when sibling modules share a basename"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let pkg1_dir = root / "pkg1" in
+            let pkg2_dir = root / "pkg2" in
+            let pkg1_init = pkg1_dir / "__init__.py" in
+            let pkg2_init = pkg2_dir / "__init__.py" in
+            let pkg1_util = pkg1_dir / "util.py" in
+            let pkg2_util = pkg2_dir / "util.py" in
+            let app_file = root / "app.py" in
+            UFile.make_directories pkg1_dir;
+            UFile.make_directories pkg2_dir;
+            UFile.write_file pkg1_init "";
+            UFile.write_file pkg2_init "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file pkg1_util
+              {|def helper():
+    return "safe"
+|};
+            UFile.write_file pkg2_util
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg2.util import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; pkg1_util; pkg2_util; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int)
+              "one interfile finding through the imported package helper" 1
+              (List.length app_matches);
+            let actual_file, actual_line = List.hd app_matches in
+            Alcotest.(check bool) "match is reported on the app file" true
+              (Fpath.equal app_file actual_file);
+            Alcotest.(check int) "match is reported on the sink line" 4
+              actual_line));
+    t "interfile taint does not overtaint sibling packages that share a basename"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let pkg1_dir = root / "pkg1" in
+            let pkg2_dir = root / "pkg2" in
+            let pkg1_init = pkg1_dir / "__init__.py" in
+            let pkg2_init = pkg2_dir / "__init__.py" in
+            let pkg1_util = pkg1_dir / "util.py" in
+            let pkg2_util = pkg2_dir / "util.py" in
+            let app_file = root / "app.py" in
+            UFile.make_directories pkg1_dir;
+            UFile.make_directories pkg2_dir;
+            UFile.write_file pkg1_init "";
+            UFile.write_file pkg2_init "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file pkg1_util
+              {|def helper():
+    return "safe"
+|};
+            UFile.write_file pkg2_util
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg1.util import helper
+
+def run():
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; pkg1_util; pkg2_util; app_file ]
+            in
+            let app_matches =
+              let res = check_file app_file in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int)
+              "no interfile finding through the safe sibling package helper" 0
+              (List.length app_matches)));
+    t "interfile taint does not overtaint sibling packages with relative imports"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg1_dir = root / "pkg1" in
+            let pkg2_dir = root / "pkg2" in
+            let pkg1_init = pkg1_dir / "__init__.py" in
+            let pkg2_init = pkg2_dir / "__init__.py" in
+            let pkg1_util = pkg1_dir / "util.py" in
+            let pkg2_util = pkg2_dir / "util.py" in
+            let pkg1_app = pkg1_dir / "app.py" in
+            UFile.make_directories pkg1_dir;
+            UFile.make_directories pkg2_dir;
+            UFile.write_file pkg1_init "";
+            UFile.write_file pkg2_init "";
+            UFile.write_file pkg1_util
+              {|def helper():
+    return "safe"
+|};
+            UFile.write_file pkg2_util
+              {|def helper():
+    return tainted()
+|};
+            UFile.write_file pkg1_app
+              {|from .util import helper
+
+def run():
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ pkg1_init; pkg2_init; pkg1_util; pkg2_util; pkg1_app ]
+            in
+            let app_matches =
+              let res = check_file pkg1_app in
+              res.matches |> List_.map TCM.location_of_pm
+            in
+            Alcotest.(check int)
+              "no interfile finding through the safe relative import helper" 0
+              (List.length app_matches)));
+    t "interfile taint across dotted package module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import pkg.helper
+
+def run():
+    sink(pkg.helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the dotted package module sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across multi-hop python imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let relay_file = root / "relay.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file relay_file
+              {|from helper import helper
+
+def relay():
+    return helper()
+|};
+            UFile.write_file app_file
+              {|from relay import relay
+
+def run():
+    sink(relay())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; helper_file; relay_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the multi-hop sink" ~file:app_file ~line:4
+              app_matches));
+    t "interfile taint reports all sink files that share a tainted helper"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_one_file = root / "app_one.py" in
+            let app_two_file = root / "app_two.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_one_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            UFile.write_file app_two_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; helper_file; app_one_file; app_two_file ]
+            in
+            let app_one_matches = match_locations check_file app_one_file in
+            let app_two_matches = match_locations check_file app_two_file in
+            check_single_match ~name:"the first shared-helper sink"
+              ~file:app_one_file ~line:4 app_one_matches;
+            check_single_match ~name:"the second shared-helper sink"
+              ~file:app_two_file ~line:4 app_two_matches));
+    t "interfile taint reports multiple sink locations in one file" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the repeated sink file"
+              ~file:app_file ~lines:[ 4; 5 ] app_matches));
+    t "interfile taint reaches sinks at module top level" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the top-level sink" ~file:app_file
+              ~line:3 app_matches));
+    t "interfile taint does not overtaint sibling helpers defined in the same module"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+
+def safe_helper():
+    return "safe"
+|};
+            UFile.write_file app_file
+              {|from helper import safe_helper
+
+def run():
+    sink(safe_helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the safe helper imported from a mixed-taint module" app_matches));
+    t "interfile taint resolves aliased imports even when the original name is shadowed locally"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper as imported_helper
+
+def helper():
+    return "safe"
+
+def run():
+    sink(helper())
+    sink(imported_helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the aliased helper sink after local shadowing" ~file:app_file
+              ~line:8 app_matches));
+    t "interfile taint does not overtaint when a local definition shadows an imported helper"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def helper():
+    return "safe"
+
+def run():
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the locally shadowed helper sink"
+              app_matches));
+    t "interfile taint does not overtaint when an imported helper is shadowed by a parameter"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run(helper):
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the parameter-shadowed helper sink"
+              app_matches));
+    t "interfile taint does not overtaint when an imported helper is shadowed in local scope"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def safe_helper():
+    return "safe"
+
+def run():
+    helper = safe_helper
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the locally rebound helper sink"
+              app_matches));
+    t "interfile taint does not overtaint when an imported helper is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def safe_helper():
+    return "safe"
+
+helper = safe_helper
+
+def run():
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the rebound imported helper sink"
+              app_matches));
+    t "interfile taint does not overtaint when an imported module alias is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import helper as helper_mod
+
+class SafeModule:
+    @staticmethod
+    def helper():
+        return "safe"
+
+helper_mod = SafeModule
+
+def run():
+    sink(helper_mod.helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the rebound imported module alias sink"
+              app_matches));
+    t "interfile taint does not report when upstream modules are outside the scan inputs"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())
+|};
+            let check_file = mk_interfile_checker root [ app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the sink with upstream modules excluded from the scan inputs"
+              app_matches));
+    t "interfile taint does not report when the source module is outside the scan inputs"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())
+|};
+            let check_file = mk_interfile_checker root [ helper_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the sink with the source module excluded from the scan inputs"
+              app_matches));
+    t "interfile taint across relative module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from . import helper
+
+def run():
+    sink(helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the relative module import sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across wildcard imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import *
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the wildcard import sink" ~file:app_file
+              ~line:4 app_matches));
+    t "interfile taint across wildcard-imported module-level values" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import *
+
+def run():
+    sink(payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the wildcard-imported value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across wildcard package re-exports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.make_directories pkg_dir;
+            UFile.write_file init_file
+              {|from .helper import helper
+|};
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from pkg import *
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the wildcard package re-export sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across wildcard package re-exported module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.make_directories pkg_dir;
+            UFile.write_file init_file
+              {|from .source import payload
+|};
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from pkg import *
+
+def run():
+    sink(payload)  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ init_file; source_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the wildcard package re-exported value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint does not overtaint wildcard-imported safe helpers from mixed modules"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+
+def safe_helper():
+    return "safe"
+|};
+            UFile.write_file app_file
+              {|from helper import *
+
+def run():
+    sink(safe_helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the wildcard-imported safe helper sink"
+              app_matches));
+    t "interfile taint does not overtaint wildcard-imported safe module-level values from mixed modules"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+safe_payload = "safe"
+|};
+            UFile.write_file app_file
+              {|from source import *
+
+def run():
+    sink(safe_payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the wildcard-imported safe value sink"
+              app_matches));
+    t "interfile taint only reports sinks before a wildcard-imported module-level value is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import *
+
+sink(payload)  # ruleid: interfile-python
+
+payload = "safe"
+
+sink(payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the rebound wildcard-imported value sinks"
+              ~file:app_file ~lines:[ 3 ] app_matches));
+    t "interfile taint across local symbol imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file app_file
+              {|def run():
+    from source import source
+    sink(source())  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local symbol import sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint across local imported module-level values" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|def run():
+    from source import payload
+    sink(payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local imported value sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint across local aliased symbol imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file app_file
+              {|def run():
+    from source import source as imported_source
+    sink(imported_source())  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local aliased symbol import sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint across local aliased imported module-level values"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|def run():
+    from source import payload as imported_payload
+    sink(imported_payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local aliased imported value sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint across local module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|def run():
+    import helper
+    sink(helper.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local module import sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint across local aliased module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|def run():
+    import helper as helper_mod
+    sink(helper_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the local aliased module import sink"
+              ~file:app_file ~line:3 app_matches));
+    t "interfile taint only reports local-imported helper sinks before a rebind"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|def safe_helper():
+    return "safe"
+
+def run():
+    from helper import helper
+    sink(helper())  # ruleid: interfile-python
+    helper = safe_helper
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the locally rebound helper sinks"
+              ~file:app_file ~lines:[ 6 ] app_matches));
+    t "interfile taint only reports local-imported module-level value sinks before a rebind"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|def run():
+    from source import payload
+    sink(payload)  # ruleid: interfile-python
+    payload = "safe"
+    sink(payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the locally rebound imported-value sinks"
+              ~file:app_file ~lines:[ 3 ] app_matches));
+    t "interfile taint across imported module-level values via module attributes"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|import source
+
+def run():
+    sink(source.payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the imported module attribute sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across aliased imported module-level values" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|import source as source_mod
+
+def run():
+    sink(source_mod.payload)  # ruleid: interfile-python
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased imported module value sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint keeps imported module attributes symbol-specific" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+safe_payload = "safe"
+|};
+            UFile.write_file app_file
+              {|import source
+
+def run():
+    sink(source.safe_payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the safe imported module attribute sink"
+              app_matches));
+    t "interfile taint across package-imported module-level attributes"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .source import payload
+|};
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|import pkg
+
+def run():
+    sink(pkg.payload)  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ init_file; source_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the package-imported value attribute sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint keeps package-imported module-level attributes symbol-specific"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file init_file
+              {|from .source import payload, safe_payload
+|};
+            UFile.write_file source_file
+              {|payload = tainted()
+safe_payload = "safe"
+|};
+            UFile.write_file app_file
+              {|import pkg
+
+def run():
+    sink(pkg.safe_payload)
+|};
+            let check_file =
+              mk_interfile_checker root [ init_file; source_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the safe package-imported value attribute sink"
+              app_matches));
+    t "interfile taint keeps mixed named imports symbol-specific" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+
+def safe_helper():
+    return "safe"
+|};
+            UFile.write_file app_file
+              {|from helper import helper, safe_helper
+
+def run():
+    sink(safe_helper())
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the mixed named-import sink"
+              ~file:app_file ~line:5 app_matches));
+    t "interfile taint only reports sinks before an imported helper is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+sink(helper())  # ruleid: interfile-python
+
+def safe_helper():
+    return "safe"
+
+helper = safe_helper
+
+sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the rebound helper sinks"
+              ~file:app_file ~lines:[ 3 ] app_matches));
+    t "interfile taint only reports sinks before an imported module alias is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|import helper as helper_mod
+
+sink(helper_mod.helper())  # ruleid: interfile-python
+
+class SafeModule:
+    @staticmethod
+    def helper():
+        return "safe"
+
+helper_mod = SafeModule
+
+sink(helper_mod.helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the rebound module-alias sinks"
+              ~file:app_file ~lines:[ 3 ] app_matches));
+    t "interfile taint only reports sinks before an imported module-level value is rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import payload
+
+sink(payload)  # ruleid: interfile-python
+
+payload = "safe"
+
+sink(payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_match_lines ~name:"the rebound imported-value sinks"
+              ~file:app_file ~lines:[ 3 ] app_matches));
+    t "interfile taint does not overtaint when an imported module-level value is shadowed by a parameter"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|payload = tainted()
+|};
+            UFile.write_file app_file
+              {|from source import payload
+
+def run(payload):
+    sink(payload)
+|};
+            let check_file = mk_interfile_checker root [ source_file; app_file ] in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the parameter-shadowed imported-value sink"
+              app_matches));
+    t "interfile taint across aliased relative module imports" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from .source import source
+
+def helper():
+    return source()
+|};
+            UFile.write_file app_file
+              {|from . import helper as helper_mod
+
+def run():
+    sink(helper_mod.helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the aliased relative module sink"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint does not overtaint cyclic imports without a tainted path"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let helper_file = root / "helper.py" in
+            let relay_file = root / "relay.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file helper_file
+              {|from relay import relay
+
+def helper():
+    return relay()
+
+def noop():
+    return "safe"
+|};
+            UFile.write_file relay_file
+              {|from helper import noop
+
+def relay():
+    noop()
+    return "safe"
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())
+|};
+            let check_file =
+              mk_interfile_checker root [ helper_file; relay_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_no_matches ~name:"the safe cyclic-import sink" app_matches));
+    t "interfile taint handles cyclic imports without losing the tainted flow"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let relay_file = root / "relay.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from relay import relay
+
+def helper():
+    return relay()
+
+def noop():
+    return "safe"
+|};
+            UFile.write_file relay_file
+              {|from helper import noop
+from source import source
+
+def relay():
+    noop()
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; helper_file; relay_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match ~name:"the cyclic-import sink" ~file:app_file
+              ~line:4 app_matches));
+    t "interfile taint across imported helper parameters" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(value):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match ~name:"the imported helper-parameter sink"
+              ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint does not overtaint imported helper parameters without a tainted caller"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(value):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    helper("safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the helper-parameter sink with only safe callers"
+              helper_matches));
+    t "interfile taint reports imported helper parameters with mixed callers"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(value):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run_safe():
+    helper("safe")
+
+def run_tainted():
+    helper(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match ~name:"the helper-parameter sink with mixed callers"
+              ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint does not overtaint when imported helper parameters are rebound"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(value):
+    value = "safe"
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the rebound helper-parameter sink from a tainted caller"
+              helper_matches));
+    t "interfile taint across imported instance-method parameters" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, value):
+        sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner().run(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match ~name:"the imported instance-method parameter sink"
+              ~file:helper_file ~line:3 helper_matches));
+    t "interfile taint across imported constructor state" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, value):
+        self.value = value
+
+    def run(self):
+        sink(self.value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner(source()).run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match ~name:"the imported constructor-state sink"
+              ~file:helper_file ~line:6 helper_matches));
+    t "interfile taint does not overtaint overwritten imported constructor state"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, value):
+        self.value = value
+
+    def run(self):
+        self.value = "safe"
+        sink(self.value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner(source()).run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the overwritten constructor-state sink from a tainted caller"
+              helper_matches));
+    t "interfile taint across multi-hop imported parameter relays" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let sink_helper_file = root / "sink_helper.py" in
+            let relay_file = root / "relay.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file sink_helper_file
+              {|def sink_value(value):
+    sink(value)
+|};
+            UFile.write_file relay_file
+              {|from sink_helper import sink_value
+
+def relay(value):
+    sink_value(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from relay import relay
+
+def run():
+    relay(source())
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ source_file; sink_helper_file; relay_file; app_file ]
+            in
+            let sink_matches = match_locations check_file app_file in
+            check_single_match ~name:"the multi-hop imported relay sink"
+              ~file:sink_helper_file ~line:2 sink_matches));
+  ]
+
+let interfile_project_graph_tests () =
+  let build_project_graph files =
+    let xlang = Xlang.of_lang Lang.Python in
+    let xtarget_of_file = Test_engine.xtarget_of_file xlang in
+    let project_inputs =
+      files
+      |> List_.map (fun file ->
+             let xtarget = xtarget_of_file file in
+             let ast, _ = Lazy.force xtarget.lazy_ast_and_errors in
+             (xtarget.path, ast, []))
+    in
+    Graph_from_AST.build_project_call_graph ~lang:Lang.Python project_inputs
+  in
+  let count_vertices_by_name graph name =
+    Call_graph.G.fold_vertex
+      (fun vertex count ->
+        if String.equal (Function_id.show vertex) name then count + 1 else count)
+      graph 0
+  in
+  let count_vertices graph =
+    Call_graph.G.fold_vertex (fun _ count -> count + 1) graph 0
+  in
+  [
+    t "project call graph keeps distinct top-level nodes per file" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let file_a = root / "a.py" in
+            let file_b = root / "b.py" in
+            UFile.write_file file_a
+              {|def f():
+    return 1
+|};
+            UFile.write_file file_b
+              {|def g():
+    return 2
+|};
+            let graph = build_project_graph [ file_a; file_b ] in
+            Alcotest.(check int) "one top-level node per file" 2
+              (count_vertices_by_name graph "<top_level>")));
+    t "project call graph keeps distinct class-init nodes per file" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let file_a = root / "a.py" in
+            let file_b = root / "b.py" in
+            UFile.write_file file_a
+              {|class Widget:
+    data = 1
+|};
+            UFile.write_file file_b
+              {|class Widget:
+    data = 2
+|};
+            let graph = build_project_graph [ file_a; file_b ] in
+            Alcotest.(check int) "one class-init node per file" 2
+              (count_vertices_by_name graph "Class:Widget")));
+    t "project call graph keeps distinct function nodes per file" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let file_a = root / "a.py" in
+            let file_b = root / "b.py" in
+            UFile.write_file file_a
+              {|def helper():
+    return 1
+|};
+            UFile.write_file file_b
+              {|def helper():
+    return 2
+|};
+            let graph = build_project_graph [ file_a; file_b ] in
+            Alcotest.(check int) "one function node per file" 2
+              (count_vertices_by_name graph "helper")));
+    t "project call graph keeps same-basename module functions distinct across directories"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg1_dir = root / "pkg1" in
+            let pkg2_dir = root / "pkg2" in
+            let pkg1_util = pkg1_dir / "util.py" in
+            let pkg2_util = pkg2_dir / "util.py" in
+            UFile.make_directories pkg1_dir;
+            UFile.make_directories pkg2_dir;
+            UFile.write_file pkg1_util
+              {|def helper():
+    return 1
+|};
+            UFile.write_file pkg2_util
+              {|def helper():
+    return 2
+|};
+            let graph = build_project_graph [ pkg1_util; pkg2_util ] in
+            Alcotest.(check int)
+              "one top-level node per same-basename module" 2
+              (count_vertices_by_name graph "<top_level>");
+            Alcotest.(check int)
+              "one helper node per same-basename module" 2
+              (count_vertices_by_name graph "helper")));
+    t "project call graph keeps distinct method nodes per file" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let file_a = root / "a.py" in
+            let file_b = root / "b.py" in
+            UFile.write_file file_a
+              {|class Widget:
+    def helper(self):
+        return 1
+|};
+            UFile.write_file file_b
+              {|class Widget:
+    def helper(self):
+        return 2
+|};
+            let graph = build_project_graph [ file_a; file_b ] in
+            Alcotest.(check int) "top-level, class-init, and method nodes stay per-file"
+              6 (count_vertices graph)));
+    t "project call graph keeps same-named methods distinct across classes in one file"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let file = root / "a.py" in
+            UFile.write_file file
+              {|class First:
+    def helper(self):
+        return 1
+
+class Second:
+    def helper(self):
+        return 2
+|};
+            let graph = build_project_graph [ file ] in
+            Alcotest.(check int)
+              "top-level, both class-init nodes, and both methods are preserved"
+              5 (count_vertices graph)));
+    t "project call graph keeps same-basename class methods distinct across directories"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg1_dir = root / "pkg1" in
+            let pkg2_dir = root / "pkg2" in
+            let pkg1_util = pkg1_dir / "util.py" in
+            let pkg2_util = pkg2_dir / "util.py" in
+            UFile.make_directories pkg1_dir;
+            UFile.make_directories pkg2_dir;
+            UFile.write_file pkg1_util
+              {|class Widget:
+    def helper(self):
+        return 1
+|};
+            UFile.write_file pkg2_util
+              {|class Widget:
+    def helper(self):
+        return 2
+|};
+            let graph = build_project_graph [ pkg1_util; pkg2_util ] in
+            Alcotest.(check int)
+              "top-level, class-init, and method nodes stay per same-basename file"
+              6 (count_vertices graph)));
+  ]
+
 let lang_tainting_tests () =
   let taint_tests_path = tests_path / "tainting_rules" in
   let lang_specs =
@@ -805,6 +3408,8 @@ let tests () =
       lang_autofix_tests ~polyglot_pattern_path;
       eval_regression_tests ();
       filter_irrelevant_rules_tests ();
+      interfile_taint_tests ();
+      interfile_project_graph_tests ();
       maturity_tests ();
       full_rule_taint_maturity_tests ();
       full_rule_regression_tests ();

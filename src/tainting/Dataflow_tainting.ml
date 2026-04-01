@@ -633,10 +633,8 @@ let effects_of_call_func_arg fun_exp fun_shape args_taints =
             (S.show_shape fun_shape));
       []
 
-let get_signature_for_object graph caller_node db method_name obj arity =
+let get_signature_for_object graph caller_node db method_name ~call_tok arity =
   (* Method call: obj.method() *)
-  (* Use obj's token (start of call expression) to match edge labels *)
-  let call_tok = snd obj.ident in
   (* First try to look up via call graph to get the correct node with definition token *)
   match Call_graph.lookup_callee_from_graph
           graph (Option.map Function_id.of_il_name caller_node) call_tok with
@@ -659,6 +657,46 @@ let try_builtin_fallback env func_name arity result =
           builtin_result
       | None -> None)
 
+let structural_call_tok_of_fun_exp fun_exp =
+  match fun_exp.e with
+  | Fetch
+      { base = Var name; rev_offset = [] }
+    when not (Tok.is_fake (snd name.ident)) ->
+      Some (snd name.ident)
+  | Fetch { rev_offset = { o = Dot name; _ } :: _; _ }
+    when not (Tok.is_fake (snd name.ident)) ->
+      Some (snd name.ident)
+  | Fetch { base = VarSpecial (_, tok); rev_offset = [] }
+    when not (Tok.is_fake tok) ->
+      Some tok
+  | _ -> None
+
+let call_tok_of_fun_exp ~default_tok fun_exp =
+  match structural_call_tok_of_fun_exp fun_exp with
+  | Some tok -> tok
+  | None -> (
+      match fun_exp.eorig with
+      | SameAs orig_exp -> (
+          match AST_generic_helpers.ii_of_any (G.E orig_exp) with
+          | tok :: _ when not (Tok.is_fake tok) -> tok
+          | _ -> default_tok)
+      | Related orig_any -> (
+          match AST_generic_helpers.ii_of_any orig_any with
+          | tok :: _ when not (Tok.is_fake tok) -> tok
+          | _ -> default_tok)
+      | NoOrig -> default_tok)
+
+let dotted_fetch_path ({ base; rev_offset } : IL.lval) =
+  let rec collect_offsets acc = function
+    | [] -> Some (List.rev acc)
+    | { IL.o = Dot name; _ } :: rest -> collect_offsets (name :: acc) rest
+    | _ -> None
+  in
+  match (base, List.rev rev_offset) with
+  | Var base_name, ((_ :: _) as offsets) ->
+      Option.map (fun names -> (base_name, names)) (collect_offsets [] offsets)
+  | _ -> None
+
 let lookup_signature_with_object_context env fun_exp arity =
   Log.debug (fun m ->
       m "TAINT_SIG_LOOKUP: Looking up %s with arity %d"
@@ -674,26 +712,14 @@ let lookup_signature_with_object_context env fun_exp arity =
           (* Try to look up via call graph using the ORIGINAL AST token position.
              This handles temp variables like _tmp:N which have eorig pointing to
              the actual callback reference in the original AST. *)
-          let call_tok =
-            match fun_exp.eorig with
-            | SameAs orig_exp ->
-                (* Use first token from original AST expression *)
-                (match AST_generic_helpers.ii_of_any (G.E orig_exp) with
-                | tok :: _ when not (Tok.is_fake tok) -> tok
-                | _ -> snd name.ident)
-            | Related orig_any ->
-                (* Related contains G.any, extract tokens directly *)
-                (match AST_generic_helpers.ii_of_any orig_any with
-                | tok :: _ when not (Tok.is_fake tok) -> tok
-                | _ -> snd name.ident)
-            | NoOrig -> snd name.ident
-          in
-          (match
+          let call_tok = call_tok_of_fun_exp ~default_tok:(snd name.ident) fun_exp in
+          let graph_lookup =
             Call_graph.lookup_callee_from_graph
               env.call_graph
               (Option.map Function_id.of_il_name env.func.name)
               call_tok
-           with
+          in
+          (match graph_lookup with
           | Some callee_node ->
               Shape_and_sig.(lookup_signature db callee_node arity)
           | None ->
@@ -705,6 +731,46 @@ let lookup_signature_with_object_context env fun_exp arity =
                   let func_name = fst name.ident in
                   let result = Shape_and_sig.lookup_signature db (Function_id.of_il_name name) arity in
                   try_builtin_fallback env func_name arity result)
+      | Fetch ({ base = Var _; rev_offset = _ :: _ :: _ } as lval) -> (
+          match dotted_fetch_path lval with
+          | Some (base_name, offset_names) -> (
+              let call_tok =
+                call_tok_of_fun_exp ~default_tok:(snd base_name.ident) fun_exp
+              in
+              match
+                Call_graph.lookup_callee_from_graph env.call_graph
+                  (Option.map Function_id.of_il_name env.func.name)
+                  call_tok
+              with
+              | Some callee_node ->
+                  Shape_and_sig.(lookup_signature db callee_node arity)
+              | None -> (
+                  match List_.init_and_last_opt offset_names with
+                  | Some (_, last_name) ->
+                      let qualified_name_str =
+                        String.concat "."
+                          (fst base_name.ident
+                          :: List_.map (fun name -> fst name.ident) offset_names)
+                      in
+                      let qualified_name =
+                        {
+                          ident = (qualified_name_str, snd last_name.ident);
+                          sid = last_name.sid;
+                          id_info = last_name.id_info;
+                        }
+                      in
+                      let result =
+                        Shape_and_sig.lookup_signature db
+                          (Function_id.of_il_name qualified_name)
+                          arity
+                      in
+                      let result =
+                        try_builtin_fallback env qualified_name_str arity result
+                      in
+                      try_builtin_fallback env (fst last_name.ident) arity
+                        result
+                  | None -> None))
+          | None -> None)
       | Fetch
           {
             base = VarSpecial ((Self | This), self_tok);
@@ -713,8 +779,10 @@ let lookup_signature_with_object_context env fun_exp arity =
         when Option.is_some env.class_name -> (
           (* Method call on self/this: self.method() or this.method() *)
           (* First try to look up via call graph to get the correct fn_id *)
-          (* Use self_tok (start of call expression) to match edge labels *)
-          let call_tok = self_tok in
+          let call_tok =
+            if Tok.is_fake (snd method_name.ident) then self_tok
+            else snd method_name.ident
+          in
           match
             Call_graph.lookup_callee_from_graph
               env.call_graph
@@ -732,7 +800,7 @@ let lookup_signature_with_object_context env fun_exp arity =
               env.func.name
               db
               (Function_id.of_il_name method_name)
-              obj
+              ~call_tok:(call_tok_of_fun_exp ~default_tok:(snd obj.ident) fun_exp)
               arity
           with
           | Some _ as result -> result
