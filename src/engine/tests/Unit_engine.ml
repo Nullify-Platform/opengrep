@@ -2942,6 +2942,158 @@ def run():
             let helper_matches = match_locations check_file app_file in
             check_single_match ~name:"the imported helper-parameter sink"
               ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint maps imported helper arguments by position" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(first, second):
+    sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper("safe", source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the imported helper sink reached through the second argument"
+              ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint keeps imported helper argument positions distinct"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(first, second):
+    sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(source(), "safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the imported helper sink when only a non-sunk parameter is tainted"
+              helper_matches));
+    t "interfile taint maps imported helper keyword arguments to parameters"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(first, second):
+    sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(second=source(), first="safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the imported helper sink reached through a keyword-mapped argument"
+              ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint keeps imported helper keyword arguments parameter-specific"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper(first, second):
+    sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(first=source(), second="safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:
+                "the imported helper sink when only a non-sunk keyword argument is tainted"
+              helper_matches));
+    t "interfile taint respects sanitizers at imported helper call sites"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let sanitizer_file = root / "sanitizer.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file sanitizer_file
+              {|def sanitize(value):
+    return "safe"
+|};
+            UFile.write_file helper_file
+              {|def helper(value):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+from sanitizer import sanitize
+from source import source
+
+def run():
+    helper(sanitize(source()))
+|};
+            let check_file =
+              mk_interfile_checker
+                ~rule_extra_sections:
+                  {|  pattern-sanitizers:
+    - pattern: sanitize(...)
+|}
+                root [ source_file; sanitizer_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the imported helper sink sanitized by the caller"
+              helper_matches));
     t "interfile taint respects sanitizers in imported helper returns" (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -3127,6 +3279,185 @@ def run():
             let helper_matches = match_locations check_file app_file in
             check_single_match ~name:"the imported instance-method parameter sink"
               ~file:helper_file ~line:3 helper_matches));
+    t "interfile taint maps imported instance-method arguments by position"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, first, second):
+        sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner().run("safe", source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the imported instance-method sink reached through the second argument"
+              ~file:helper_file ~line:3 helper_matches));
+    t "interfile taint keeps imported instance-method argument positions distinct"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, first, second):
+        sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner().run(source(), "safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:
+                "the imported instance-method sink when only a non-sunk parameter is tainted"
+              helper_matches));
+    t "interfile taint maps imported instance-method keyword arguments to parameters"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, first, second):
+        sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner().run(second=source(), first="safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the imported instance-method sink reached through a keyword-mapped argument"
+              ~file:helper_file ~line:3 helper_matches));
+    t "interfile taint keeps imported instance-method keyword arguments parameter-specific"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, first, second):
+        sink(second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner().run(first=source(), second="safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:
+                "the imported instance-method sink when only a non-sunk keyword argument is tainted"
+              helper_matches));
+    t "interfile taint across stored imported instance-method parameters"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, value):
+        sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    runner = Runner()
+    runner.run(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the stored imported instance-method parameter sink"
+              ~file:helper_file ~line:3 helper_matches));
+    t "interfile taint does not report stored imported instance-method parameters with safe input"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def run(self, value):
+        sink(value)
+|};
+            UFile.write_file app_file
+              {|from helper import Runner
+
+def run():
+    runner = Runner()
+    runner.run("safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the stored imported instance-method sink with safe input"
+              helper_matches));
     t "interfile taint across imported constructor state" (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -3157,6 +3488,169 @@ def run():
             let helper_matches = match_locations check_file app_file in
             check_single_match ~name:"the imported constructor-state sink"
               ~file:helper_file ~line:6 helper_matches));
+    t "interfile taint across stored imported constructor state" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, value):
+        self.value = value
+
+    def run(self):
+        sink(self.value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    runner = Runner(source())
+    runner.run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the stored imported constructor-state sink"
+              ~file:helper_file ~line:6 helper_matches));
+    t "interfile taint does not report stored imported constructor state with safe input"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, value):
+        self.value = value
+
+    def run(self):
+        sink(self.value)
+|};
+            UFile.write_file app_file
+              {|from helper import Runner
+
+def run():
+    runner = Runner("safe")
+    runner.run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the stored imported constructor-state sink with safe input"
+              helper_matches));
+    t "interfile taint exposes stored imported constructor fields to callers"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, value):
+        self.value = value
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    runner = Runner(source())
+    sink(runner.value)
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the caller-side sink for stored imported constructor state"
+              ~file:app_file ~line:6 app_matches));
+    t "interfile taint maps imported constructor keyword arguments to fields"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, first, second):
+        self.first = first
+        self.second = second
+
+    def run(self):
+        sink(self.second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    runner = Runner(second=source(), first="safe")
+    runner.run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the imported constructor sink reached through a keyword field"
+              ~file:helper_file ~line:7 helper_matches));
+    t "interfile taint keeps imported constructor keyword arguments field-specific"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    def __init__(self, first, second):
+        self.first = first
+        self.second = second
+
+    def run(self):
+        sink(self.second)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    runner = Runner(first=source(), second="safe")
+    runner.run()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:
+                "the imported constructor sink when only a non-sunk keyword field is tainted"
+              helper_matches));
     t "interfile taint does not overtaint overwritten imported constructor state"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->

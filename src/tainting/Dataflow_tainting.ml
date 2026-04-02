@@ -826,6 +826,53 @@ let lookup_signature env fun_exp =
         (Option.fold ~none:"<none>" ~some:Call_graph.show_node (Option.map Function_id.of_il_name env.func.name)));
   lookup_signature_with_object_context env fun_exp
 
+let receiver_lval_for_constructor_call env lval_opt fun_exp =
+  let looks_like_constructor_name name =
+    List.mem name
+      (Object_initialization.get_constructor_names env.taint_inst.lang)
+  in
+  let bare_call_name_looks_like_constructor name =
+    (not (Object_initialization.uses_new_keyword env.taint_inst.lang))
+    && String.length name > 0
+    && Char.equal (Char.uppercase_ascii name.[0]) name.[0]
+  in
+  match lval_opt with
+  | None -> None
+  | Some receiver_lval ->
+      let call_tok_opt =
+        match fun_exp.e with
+        | Fetch { base = Var name; rev_offset = [] } ->
+            Some (call_tok_of_fun_exp ~default_tok:(snd name.ident) fun_exp)
+        | Fetch { base = VarSpecial ((Self | This), self_tok); rev_offset = _ } ->
+            Some (call_tok_of_fun_exp ~default_tok:self_tok fun_exp)
+        | Fetch { base = Var obj; rev_offset = _ } ->
+            Some (call_tok_of_fun_exp ~default_tok:(snd obj.ident) fun_exp)
+        | _ -> None
+      in
+      let resolved_constructor =
+        match (env.func.name, call_tok_opt) with
+        | Some caller_name, Some call_tok -> (
+            match
+              Call_graph.lookup_callee_from_graph env.call_graph
+                (Some (Function_id.of_il_name caller_name))
+                call_tok
+            with
+            | Some callee_node ->
+                looks_like_constructor_name (Call_graph.show_node callee_node)
+            | None -> false)
+        | _ -> false
+      in
+      let syntactic_fallback =
+        match fun_exp.e with
+        | Fetch { base = Var name; rev_offset = [] } ->
+            let callee_name = fst name.ident in
+            looks_like_constructor_name callee_name
+            || bare_call_name_looks_like_constructor callee_name
+        | _ -> false
+      in
+      if resolved_constructor || syntactic_fallback then Some receiver_lval
+      else None
+
 (*****************************************************************************)
 (* Lambdas *)
 (*****************************************************************************)
@@ -1604,7 +1651,7 @@ let check_tainted_var env (var : IL.name) : Taints.t * S.shape * Lval_env.t =
    2) Are there any effects that occur within the function due to taints being
       input into the function body, from the calling context?
 *)
-let check_function_call env fun_exp args
+let check_function_call ?receiver_lval env fun_exp args
     (args_taints : (Taints.t * S.shape) argument list)
     ?(_implicit_lambda : (IL.exp * IL.function_definition) option = None) () :
     (Taints.t * S.shape * Lval_env.t) option =
@@ -1630,7 +1677,7 @@ let check_function_call env fun_exp args
       in
       let* call_effects =
         Sig_inst.instantiate_function_signature env.lval_env fun_sig
-          ~callee:fun_exp ~args:(Some args) args_taints
+          ~callee:fun_exp ~args:(Some args) args_taints ?receiver_lval
           ~lookup_sig:lookup_sig_fn ()
       in
       Log.debug (fun m ->
@@ -2032,8 +2079,11 @@ let call_with_intrafile lval_opt e env args instr =
                 (all_args_taints, S.Bot, lval_env)))
     | None ->
         (* No implicit lambda, try unified constructor execution *)
+        let receiver_lval =
+          receiver_lval_for_constructor_call env lval_opt e
+        in
         let check_function_call_wrapper env' e' args' args_taints' =
-          check_function_call env' e' args' args_taints' ()
+          check_function_call ?receiver_lval env' e' args' args_taints' ()
         in
         match
           Object_initialization.execute_unified_constructor e args args_taints
@@ -2044,7 +2094,10 @@ let call_with_intrafile lval_opt e env args instr =
             (* Regular function call processing *)
             Log.debug (fun m ->
                 m "INTRAFILE: Checking function call %s" (Display_IL.string_of_exp e));
-            match check_function_call { env with lval_env } e args args_taints () with
+            match
+              check_function_call ?receiver_lval { env with lval_env } e args
+                args_taints ()
+            with
         | Some (call_taints, shape, lval_env) ->
             Log.debug (fun m ->
                 m ~tags:sigs_tag "- Instantiating %s: returns %s & %s"
@@ -2159,7 +2212,7 @@ let call_with_intrafile lval_opt e env args instr =
   in
   (all_call_taints, shape, lval_env)
 
-let new_with_intrafile env _result_lval _ty args constructor =
+let new_with_intrafile env result_lval _ty args constructor =
   (* 'New' with reference to constructor - use constructor signatures *)
   let args_taints, all_args_taints, lval_env =
     check_function_call_arguments env args
@@ -2167,7 +2220,8 @@ let new_with_intrafile env _result_lval _ty args constructor =
   let call_result =
     (* Try unified constructor execution first *)
     let check_function_call_wrapper env' e' args' args_taints' =
-      check_function_call env' e' args' args_taints' ()
+      check_function_call ~receiver_lval:result_lval env' e' args' args_taints'
+        ()
     in
     match
       Object_initialization.execute_unified_constructor constructor args
@@ -2175,7 +2229,8 @@ let new_with_intrafile env _result_lval _ty args constructor =
     with
     | Some (call_taints, shape, lval_env) -> Some (call_taints, shape, lval_env)
     | None ->
-        check_function_call { env with lval_env } constructor args args_taints ()
+        check_function_call ~receiver_lval:result_lval
+          { env with lval_env } constructor args args_taints ()
   in
   match call_result with
   | Some (call_taints, shape, lval_env) -> (call_taints, shape, lval_env)

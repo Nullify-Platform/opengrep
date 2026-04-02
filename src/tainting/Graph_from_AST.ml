@@ -202,6 +202,139 @@ let add_imported_entity imported_entity_index canonical func =
       | None -> Some [ func ])
     imported_entity_index
 
+let class_name_of_constructor_fn_id ~(lang : Lang.t) (fn_id : fn_id) :
+    G.name option =
+  match fn_id with
+  | [ Some cls; Some meth ] ->
+      let class_name = fst cls.IL.ident in
+      let method_name = fst meth.IL.ident in
+      if Object_initialization.is_constructor lang method_name (Some class_name)
+      then Some (G.Id ((class_name, snd cls.IL.ident), G.empty_id_info ()))
+      else None
+  | _ -> None
+
+let imported_class_name ~(lang : Lang.t) ~imported_entity_index
+    ~(canonical : string list) ~(default_tok : Tok.t) ?current_file :
+    unit -> G.name option =
+ fun () ->
+  let rec has_prefix prefix segments =
+    match (prefix, segments) with
+    | [], _ -> true
+    | _, [] -> false
+    | p :: prefix_rest, s :: segments_rest ->
+        String.equal p s && has_prefix prefix_rest segments_rest
+  in
+  match
+    Option.bind
+      (lookup_imported_entity ?current_file imported_entity_index canonical)
+      (class_name_of_constructor_fn_id ~lang)
+  with
+  | Some _ as result -> result
+  | None ->
+      let candidate_matches =
+        canonical_lookup_candidates ?current_file canonical
+        |> List.exists (fun candidate ->
+               CanonicalMap.exists
+                 (fun indexed_canonical _funcs ->
+                   has_prefix candidate indexed_canonical
+                   && List.length indexed_canonical > List.length candidate)
+                 imported_entity_index)
+      in
+      if candidate_matches then
+        match List_.last_opt canonical with
+        | Some class_name ->
+            Some (G.Id ((class_name, default_tok), G.empty_id_info ()))
+        | None -> None
+      else None
+
+let imported_constructor_class_name ~(lang : Lang.t) ~imported_entity_index
+    (expr : G.expr) ?current_file : unit -> G.name option =
+ fun () ->
+  let default_tok =
+    match AST_generic_helpers.ii_of_any (G.E expr) with
+    | tok :: _ -> tok
+    | [] -> Tok.unsafe_fake_tok "<imported-class>"
+  in
+  match expr.G.e with
+  | G.Call (callee, _) -> (
+      match callee.G.e with
+      | G.N (G.Id (_, id_info)) -> (
+          match !(id_info.G.id_resolved) with
+          | Some (G.ImportedEntity canonical, _sid) ->
+              imported_class_name ~lang ~imported_entity_index ~canonical
+                ~default_tok ?current_file ()
+          | _ -> None)
+      | G.N (G.IdQualified ({ name_last = _; name_info; _ } as qualified_info)) -> (
+          match !(name_info.G.id_resolved) with
+          | Some (G.ImportedEntity canonical, _sid) ->
+              imported_class_name ~lang ~imported_entity_index ~canonical
+                ~default_tok ?current_file ()
+          | _ ->
+              let canonical =
+                AST_generic_helpers.dotted_ident_of_name
+                  (G.IdQualified qualified_info)
+                |> List_.map fst
+              in
+              imported_class_name ~lang ~imported_entity_index ~canonical
+                ~default_tok ?current_file ())
+      | G.DotAccess ({ e = G.N (G.Id ((obj_name, _), obj_info)); _ }, _, G.FN (G.Id ((id, _), _))) -> (
+          match !(obj_info.G.id_resolved) with
+          | Some (G.ImportedModule canonical_module, _sid) ->
+              imported_class_name ~lang ~imported_entity_index
+                ~canonical:(canonical_module @ [ id ])
+                ~default_tok ?current_file ()
+          | Some (G.ImportedEntity canonical_entity, _sid) ->
+              imported_class_name ~lang ~imported_entity_index
+                ~canonical:(canonical_entity @ [ id ])
+                ~default_tok ?current_file ()
+          | _ ->
+              imported_class_name ~lang ~imported_entity_index
+                ~canonical:[ obj_name; id ] ~default_tok ?current_file ())
+      | _ -> None)
+  | _ -> None
+
+let detect_imported_object_initialization ~(lang : Lang.t) ~imported_entity_index
+    (ast : G.program) ?current_file : unit -> (G.name * G.name) list =
+ fun () ->
+  let object_mappings = ref [] in
+  let add_mapping var_name init_expr =
+    match
+      imported_constructor_class_name ~lang ~imported_entity_index init_expr
+        ?current_file ()
+    with
+    | Some cls -> object_mappings := (var_name, cls) :: !object_mappings
+    | None -> ()
+  in
+  let visitor =
+    object
+      inherit [_] G.iter as super
+
+      method! visit_stmt () stmt =
+        (match stmt.G.s with
+        | G.ExprStmt (expr, _) -> (
+            match expr.G.e with
+            | G.Assign (lval_expr, _, rval_expr)
+            | G.AssignOp (lval_expr, _, rval_expr) -> (
+                match lval_expr.G.e with
+                | G.N var_name -> add_mapping var_name rval_expr
+                | _ -> ())
+            | _ -> ())
+        | _ -> ());
+        super#visit_stmt () stmt
+
+      method! visit_definition () def =
+        (match def with
+        | entity, G.VarDef var_def -> (
+            match (entity.G.name, var_def.G.vinit) with
+            | G.EN var_name, Some init_expr -> add_mapping var_name init_expr
+            | _ -> ())
+        | _ -> ());
+        super#visit_definition () def
+    end
+  in
+  visitor#visit_program () ast;
+  !object_mappings
+
 let starts_with_segments ~prefix segments =
   let rec aux prefix segments =
     match (prefix, segments) with
@@ -665,6 +798,10 @@ let identify_callee ?(object_mappings = []) ?(all_funcs = [])
                       | G.Id ((str, _), _) -> str
                       | _ -> ""
                     in
+                    let imported_method =
+                      lookup_imported_entity ?current_file imported_entity_index
+                        [ class_name_str; method_name_str ]
+                    in
                     (* Find all methods matching class and name *)
                     let method_matches = List.filter (fun f ->
                       is_local_function f &&
@@ -672,7 +809,10 @@ let identify_callee ?(object_mappings = []) ?(all_funcs = [])
                       | [Some c; Some m] when fst c.IL.ident = class_name_str && fst m.IL.ident = method_name_str -> true
                       | _ -> false
                     ) all_funcs in
-                    (match method_matches with
+                    (match imported_method with
+                    | Some _ as result -> result
+                    | None ->
+                    match method_matches with
                     | [single_match] -> Some single_match.fn_id  (* Exactly one match by name *)
                     | [] -> None
                     | _ ->
@@ -1377,6 +1517,16 @@ let importable_segments_of_fn_id (fn_id : fn_id) =
       Some [ fst cls.IL.ident; fst meth.IL.ident ]
   | _ -> None
 
+let constructor_import_alias_segments ~(lang : Lang.t) (fn_id : fn_id) =
+  match fn_id with
+  | [ Some cls; Some meth ] ->
+      let class_name = fst cls.IL.ident in
+      let method_name = fst meth.IL.ident in
+      if Object_initialization.is_constructor lang method_name (Some class_name)
+      then Some [ class_name ]
+      else None
+  | _ -> None
+
 let collect_imported_aliases (ast : G.program) :
     (string list * string) list =
   let aliases = ref [] in
@@ -1422,7 +1572,7 @@ let collect_imported_wildcards (ast : G.program) : string list list =
   visitor#visit_program () ast;
   !wildcards
 
-let build_imported_entity_index (files : project_file list) =
+let build_imported_entity_index ~(lang : Lang.t) (files : project_file list) =
   let module_candidates_for_file file =
     (* Keep every suffix of the full filesystem path. Trimming the shared
      * prefix drops package segments when all files live under the same
@@ -1437,15 +1587,28 @@ let build_imported_entity_index (files : project_file list) =
         file.funcs
         |> List.fold_left
              (fun acc func ->
-               match importable_segments_of_fn_id func.fn_id with
-               | Some entity_segments ->
-                   module_candidates
-                   |> List.fold_left
-                        (fun acc module_name ->
-                          let canonical = module_name @ entity_segments in
-                          add_imported_entity acc canonical func)
-                        acc
-               | _ -> acc)
+               let entity_segments =
+                 importable_segments_of_fn_id func.fn_id |> Option.to_list
+               in
+               let entity_segments =
+                 match constructor_import_alias_segments ~lang func.fn_id with
+                 | Some alias_segments when not (List.mem alias_segments entity_segments)
+                   ->
+                     alias_segments :: entity_segments
+                 | Some _
+                 | None ->
+                     entity_segments
+               in
+               entity_segments
+               |> List.fold_left
+                    (fun acc entity_segments ->
+                      module_candidates
+                      |> List.fold_left
+                           (fun acc module_name ->
+                             let canonical = module_name @ entity_segments in
+                             add_imported_entity acc canonical func)
+                           acc)
+                    acc)
              acc)
       CanonicalMap.empty files
   in
@@ -1456,19 +1619,43 @@ let build_imported_entity_index (files : project_file list) =
         collect_imported_aliases file.ast
         |> List.fold_left
              (fun acc (canonical_target, local_name) ->
-               match
-                 lookup_imported_func
-                   ~current_file:file.path.internal_path_to_content base_index
-                   canonical_target
-               with
-               | None -> acc
-               | Some func ->
-                   module_candidates
-                   |> List.fold_left
-                        (fun acc module_name ->
-                          add_imported_entity acc (module_name @ [ local_name ])
-                            func)
-                        acc)
+               let acc =
+                 match
+                   lookup_imported_func
+                     ~current_file:file.path.internal_path_to_content base_index
+                     canonical_target
+                 with
+                 | None -> acc
+                 | Some func ->
+                     module_candidates
+                     |> List.fold_left
+                          (fun acc module_name ->
+                            add_imported_entity acc (module_name @ [ local_name ])
+                              func)
+                          acc
+               in
+               CanonicalMap.fold
+                 (fun canonical funcs acc ->
+                   if
+                     List.length funcs <> 1
+                     || List.length canonical <= List.length canonical_target
+                     || not
+                          (starts_with_segments ~prefix:canonical_target
+                             canonical)
+                   then acc
+                   else
+                     let tail =
+                       List_.drop (List.length canonical_target) canonical
+                     in
+                     let func = List.hd funcs in
+                     module_candidates
+                     |> List.fold_left
+                          (fun acc module_name ->
+                            add_imported_entity acc
+                              (module_name @ (local_name :: tail))
+                              func)
+                          acc)
+                 base_index acc)
              acc
       in
       collect_imported_wildcards file.ast
@@ -1513,13 +1700,20 @@ let build_project_call_graph ~(lang : Lang.t)
            { path; ast; object_mappings; funcs = collect_functions ~lang ast })
   in
   let graph = Call_graph.G.create () in
-  let imported_entity_index = build_imported_entity_index files in
+  let imported_entity_index = build_imported_entity_index ~lang files in
   let all_funcs = files |> List.concat_map (fun file -> file.funcs) in
   files
   |> List.iter (fun file ->
+         let imported_object_mappings =
+           detect_imported_object_initialization ~lang ~imported_entity_index
+             file.ast ~current_file:file.path.internal_path_to_content ()
+         in
+         let object_mappings =
+           file.object_mappings @ imported_object_mappings
+         in
          let local_graph =
            build_call_graph_with_context ~lang
-             ~object_mappings:file.object_mappings
+             ~object_mappings
              ~all_funcs ~imported_entity_index
              ~current_file:file.path.internal_path_to_content file.ast
          in
