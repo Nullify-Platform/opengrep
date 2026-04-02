@@ -812,6 +812,96 @@ def run():
               actual_line;
             Alcotest.(check int) "no finding in safe file" 0
               (List.length safe_app_matches)));
+    t "interfile taint across local imports inside imported helpers" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper():
+    from source import source
+    return source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the helper sink reached through an upstream local import"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across local module imports inside imported helpers"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper():
+    import source as source_mod
+    return source_mod.source()
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the helper sink reached through an upstream local module import"
+              ~file:app_file ~line:4 app_matches));
+    t "interfile taint across local relative imports inside imported helpers"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let pkg_dir = root / "pkg" in
+            UFile.make_directories pkg_dir;
+            let init_file = pkg_dir / "__init__.py" in
+            let source_file = pkg_dir / "source.py" in
+            let helper_file = pkg_dir / "helper.py" in
+            let app_file = pkg_dir / "app.py" in
+            UFile.write_file init_file "";
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def helper():
+    from .source import source
+    return source()
+|};
+            UFile.write_file app_file
+              {|from .helper import helper
+
+def run():
+    sink(helper())  # ruleid: interfile-python
+|};
+            let check_file =
+              mk_interfile_checker root
+                [ init_file; source_file; helper_file; app_file ]
+            in
+            let app_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the helper sink reached through an upstream local relative import"
+              ~file:app_file ~line:4 app_matches));
     t "interfile taint is independent of scan input order" (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -1426,6 +1516,35 @@ def run():
               true (Fpath.equal app_file actual_file);
             Alcotest.(check int) "match is reported on the imported method sink line"
               4 actual_line));
+    t "interfile taint across imported classmethod parameters" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|class Runner:
+    @classmethod
+    def run(cls, value):
+        sink(value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import Runner
+
+def run():
+    Runner.run(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the imported classmethod-parameter sink"
+              ~file:helper_file ~line:4 helper_matches));
     t "interfile taint across imported instance methods" (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -2972,6 +3091,64 @@ def run():
             let helper_matches = match_locations check_file app_file in
             check_single_match ~name:"the imported helper-parameter sink"
               ~file:helper_file ~line:2 helper_matches));
+    t "interfile taint across imported helper default parameters" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper(value=source()):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    helper()
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:"the imported helper sink reached through a tainted default"
+              ~file:helper_file ~line:4 helper_matches));
+    t
+      "interfile taint does not overtaint imported helper default parameters when callers override them"
+      (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|from source import source
+
+def helper(value=source()):
+    sink(value)
+|};
+            UFile.write_file app_file
+              {|from helper import helper
+
+def run():
+    helper("safe")
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_no_matches
+              ~name:"the imported helper sink when a tainted default is overridden"
+              helper_matches));
     t "interfile taint across module-qualified imported helper parameters"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
@@ -3113,6 +3290,37 @@ def run():
               ~name:
                 "the imported helper sink when only a non-sunk keyword argument is tainted"
               helper_matches));
+    t "interfile taint maps imported helper keyword argument relays" (fun () ->
+        Testutil_files.with_tempdir ~chdir:true (fun root ->
+            let source_file = root / "source.py" in
+            let helper_file = root / "helper.py" in
+            let app_file = root / "app.py" in
+            UFile.write_file source_file
+              {|def source():
+    return tainted()
+|};
+            UFile.write_file helper_file
+              {|def sink_value(danger):
+    sink(danger)
+
+def helper(value):
+    sink_value(danger=value)
+|};
+            UFile.write_file app_file
+              {|from source import source
+from helper import helper
+
+def run():
+    helper(source())
+|};
+            let check_file =
+              mk_interfile_checker root [ source_file; helper_file; app_file ]
+            in
+            let helper_matches = match_locations check_file app_file in
+            check_single_match
+              ~name:
+                "the imported helper sink reached through a keyword relay"
+              ~file:helper_file ~line:2 helper_matches));
     t "interfile taint maps imported variadic helper arguments by position"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->

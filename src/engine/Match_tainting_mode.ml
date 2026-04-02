@@ -567,6 +567,110 @@ let get_arity params info lang =
   in
   List.length filtered_params
 
+let filtered_signature_params params info lang =
+  match (lang, info.class_name_str) with
+  (* Python methods: filter out 'self' and 'cls' params *)
+  | Lang.Python, Some _ ->
+      List.filter
+        (function
+          | G.Param { pname = Some (("self" | "cls"), _); _ } -> false
+          | _ -> true)
+        params
+  (* Go methods: filter out ParamReceiver *)
+  | Lang.Go, Some _ ->
+      List.filter
+        (function
+          | G.ParamReceiver _ -> false
+          | _ -> true)
+        params
+  | _ -> params
+
+let rec trailing_default_params acc = function
+  | G.Param { pname = Some id; pinfo = id_info; pdefault = Some default; _ }
+    :: rest ->
+      trailing_default_params ((id, id_info, default) :: acc) rest
+  | [] -> acc
+  | _ :: _ -> acc
+
+let python_trailing_default_params params info =
+  filtered_signature_params params info Lang.Python |> List.rev
+  |> trailing_default_params [] |> List.rev
+
+let default_assignment_stmt (id, id_info, default_expr) =
+  G.Assign (G.N (G.Id (id, id_info)) |> G.e, Tok.fake_tok (snd id) "=", default_expr)
+  |> G.e |> G.exprstmt
+
+let prepend_default_assignments defaults (fbody : G.function_body) :
+    G.function_body =
+  let body_stmt = H.funcbody_to_stmt fbody in
+  let prologue = defaults |> List_.map default_assignment_stmt in
+  G.FBStmt (G.Block (Tok.unsafe_fake_bracket (prologue @ [ body_stmt ])) |> G.s)
+
+let extract_single_arity_signatures ~(lang : Lang.t) ~(ctx : AST_to_IL.ctx)
+    ~(taint_inst : Taint_rule_inst.t) ~(ast : G.program)
+    ?(builtin_signature_db : Shape_and_sig.builtin_signature_database option)
+    ~(call_graph : Call_graph.G.t) (info : fun_info)
+    (db : Shape_and_sig.signature_database) :
+    Shape_and_sig.signature_database =
+  let params = Tok.unbracket info.fdef.fparams in
+  let arity = get_arity params info lang in
+  let extract_signature_for cfg arity db =
+    fst
+      (Taint_signature_extractor.extract_signature_with_file_context
+         ~arity:(Shape_and_sig.Arity_exact arity) ~db ?builtin_signature_db
+         taint_inst ~name:info.name
+         ~method_properties:info.method_properties
+         ~call_graph:(Some call_graph) cfg ast)
+  in
+  let updated_db =
+    extract_signature_for info.cfg arity db
+  in
+  let updated_db =
+    if Lang.equal lang Lang.Python then
+      let default_suffix = python_trailing_default_params params info in
+      default_suffix
+      |> List_.mapi (fun i _ -> i + 1)
+      |> List.fold_left
+           (fun acc omitted_count ->
+             let kept_params =
+               List_.take (List.length params - omitted_count) params
+             in
+             let kept_arity = arity - omitted_count in
+             let omitted_defaults =
+               default_suffix
+               |> List_.drop (List.length default_suffix - omitted_count)
+             in
+             let synthetic_fdef : G.function_definition =
+               {
+                 info.fdef with
+                 G.fparams = Tok.unsafe_fake_bracket kept_params;
+                 fbody = prepend_default_assignments omitted_defaults info.fdef.fbody;
+               }
+             in
+             let fdef_il =
+               AST_to_IL.function_definition lang ~ctx synthetic_fdef
+             in
+             let cfg = CFG_build.cfg_of_fdef fdef_il in
+             extract_signature_for cfg kept_arity acc)
+           updated_db
+    else updated_db
+  in
+  if Lang.equal lang Lang.Kotlin && arity >= 1 then
+    let last_param_is_lambda =
+      match List.rev params with
+      | G.Param { G.ptype = Some { t = G.TyFun _; _ }; _ } :: _ -> true
+      | _ -> false
+    in
+    if last_param_is_lambda then
+      fst
+        (Taint_signature_extractor.extract_signature_with_file_context
+           ~arity:(Shape_and_sig.Arity_exact (arity - 1))
+           ~db:updated_db ?builtin_signature_db taint_inst ~name:info.name
+           ~method_properties:info.method_properties
+           ~call_graph:(Some call_graph) info.cfg ast)
+    else updated_db
+  else updated_db
+
 (** Convert a Case pattern back into a [G.parameter list] for per-arity
     signature extraction (Clojure multi-arity / Elixir multi-clause). *)
 let params_of_case_pattern (pat : G.pattern) : G.parameter list =
@@ -790,33 +894,8 @@ let add_signatures_for_fun_info ~(lang : Lang.t) ~(ctx : AST_to_IL.ctx)
           db')
         db arity_cases
   | None ->
-      let params = Tok.unbracket info.fdef.fparams in
-      let arity = get_arity params info lang in
-      let updated_db, _signature =
-        Taint_signature_extractor.extract_signature_with_file_context
-          ~arity:(Shape_and_sig.Arity_exact arity) ~db
-          ?builtin_signature_db taint_inst ~name:info.name
-          ~method_properties:info.method_properties
-          ~call_graph:(Some call_graph) info.cfg ast
-      in
-      if Lang.equal lang Lang.Kotlin && arity >= 1 then
-        let last_param_is_lambda =
-          match List.rev params with
-          | G.Param { G.ptype = Some { t = G.TyFun _; _ }; _ } :: _ -> true
-          | _ -> false
-        in
-        if last_param_is_lambda then
-          let db', _ =
-            Taint_signature_extractor.extract_signature_with_file_context
-              ~arity:(Shape_and_sig.Arity_exact (arity - 1))
-              ~db:updated_db ?builtin_signature_db taint_inst
-              ~name:info.name
-              ~method_properties:info.method_properties
-              ~call_graph:(Some call_graph) info.cfg ast
-          in
-          db'
-        else updated_db
-      else updated_db
+      extract_single_arity_signatures ~lang ~ctx ~taint_inst ~ast
+        ?builtin_signature_db ~call_graph info db
 
 let check_function_defs_for_matches ~(lang : Lang.t) ~(ctx : AST_to_IL.ctx)
     ~(taint_inst : Taint_rule_inst.t) ~(glob_env : Taint_lval_env.t)
@@ -1293,41 +1372,9 @@ let check_rule per_file_formula_cache (rule : R.taint_rule) match_hook
                 in
                 run_check_fundef_if_needed info updated_db
             | None ->
-                (* Single-arity path (unchanged logic) *)
-                let params = Tok.unbracket info.fdef.fparams in
-                let arity = get_arity params info lang in
-                let updated_db, _signature =
-                  Taint_signature_extractor.extract_signature_with_file_context
-                    ~arity:(Shape_and_sig.Arity_exact arity) ~db
-                    ?builtin_signature_db taint_inst ~name:info.name
-                    ~method_properties:info.method_properties
-                    ~call_graph:(Some relevant_graph) info.cfg ast
-                in
-                (* For Kotlin, if the last parameter is a lambda (function type),
-                 * also extract signature with arity-1 to handle trailing lambda syntax:
-                 * f(a, b) vs f(a) { b } *)
                 let updated_db =
-                  if Lang.equal lang Lang.Kotlin && arity >= 1 then
-                    let last_param_is_lambda =
-                      match List.rev params with
-                      | G.Param { G.ptype = Some { t = G.TyFun _; _ }; _ } :: _
-                        ->
-                          true
-                      | _ -> false
-                    in
-                    if last_param_is_lambda then
-                      let db', _ =
-                        Taint_signature_extractor
-                        .extract_signature_with_file_context
-                          ~arity:(Shape_and_sig.Arity_exact (arity - 1))
-                          ~db:updated_db ?builtin_signature_db taint_inst
-                          ~name:info.name
-                          ~method_properties:info.method_properties
-                          ~call_graph:(Some relevant_graph) info.cfg ast
-                      in
-                      db'
-                    else updated_db
-                  else updated_db
+                  extract_single_arity_signatures ~lang ~ctx ~taint_inst ~ast
+                    ?builtin_signature_db ~call_graph:relevant_graph info db
                 in
                 run_check_fundef_if_needed info updated_db
           in
