@@ -666,6 +666,35 @@ let identify_callee ?(object_mappings = []) ?(all_funcs = [])
             in
             Option.map (fun f -> f.fn_id) free_fn_match)
   in
+  let resolve_method_call_in_class class_name_str method_name_str =
+    let method_matches =
+      List.filter
+        (fun f ->
+          is_local_function f
+          &&
+          match f.fn_id with
+          | [ Some c; Some m ] ->
+              String.equal (fst c.IL.ident) class_name_str
+              && String.equal (fst m.IL.ident) method_name_str
+          | _ -> false)
+        all_funcs
+    in
+    match method_matches with
+    | [ single_match ] -> Some single_match.fn_id
+    | [] -> None
+    | _ -> (
+        match call_arity with
+        | Some arity ->
+            let arity_matches =
+              List.filter
+                (fun f -> Int.equal (get_func_arity f.fdef) arity)
+                method_matches
+            in
+            (match arity_matches with
+            | [ single_match ] -> Some single_match.fn_id
+            | _ -> None)
+        | None -> None)
+  in
   match callee.G.e with
     (* Simple function call: foo() *)
     | G.N (G.Id ((id, _), id_info)) -> (
@@ -828,43 +857,57 @@ let identify_callee ?(object_mappings = []) ?(all_funcs = [])
                         | None -> None))  (* No arity info, can't disambiguate *)
                 | None -> None)))
         | G.DotAccess
-            ( { e = G.Call ({ e = G.N (G.Id ((class_name, _), class_info)); _ }, _); _ },
-              _,
-              G.FN (G.Id ((id, _), _id_info)) ) -> (
+            ({ e = G.Call (constructor_callee, _); _ }, _,
+             G.FN (G.Id ((id, _), _id_info))) -> (
             let method_name_str = id in
-            match !(class_info.G.id_resolved) with
-            | Some (G.ImportedEntity canonical_entity, _sid) ->
+            let imported_method =
+              let lookup canonical =
                 lookup_imported_entity ?current_file imported_entity_index
-                  (canonical_entity @ [ method_name_str ])
-            | Some _
+                  (canonical @ [ method_name_str ])
+              in
+              match constructor_callee.G.e with
+              | G.N (G.Id ((_class_name, _), class_info)) -> (
+                  match !(class_info.G.id_resolved) with
+                  | Some (G.ImportedEntity canonical_entity, _sid)
+                  | Some (G.ImportedModule canonical_entity, _sid) ->
+                      lookup canonical_entity
+                  | Some _
+                  | None ->
+                      None)
+              | G.N
+                  (G.IdQualified
+                    ({ name_last = _; name_info; _ } as qualified_info)) -> (
+                  match !(name_info.G.id_resolved) with
+                  | Some (G.ImportedEntity canonical_entity, _sid)
+                  | Some (G.ImportedModule canonical_entity, _sid) ->
+                      lookup canonical_entity
+                  | Some _
+                  | None ->
+                      let canonical =
+                        AST_generic_helpers.dotted_ident_of_name
+                          (G.IdQualified qualified_info)
+                        |> List_.map fst
+                      in
+                      lookup canonical)
+              | G.DotAccess _ -> (
+                  match dotted_name_segments_of_expr constructor_callee with
+                  | Some canonical -> lookup canonical
+                  | None -> None)
+              | _ -> None
+            in
+            match imported_method with
+            | Some _ as result -> result
             | None ->
-                let method_matches =
-                  List.filter
-                    (fun f ->
-                      is_local_function f
-                      &&
-                      match f.fn_id with
-                      | [ Some c; Some m ] ->
-                          String.equal (fst c.IL.ident) class_name
-                          && String.equal (fst m.IL.ident) method_name_str
-                      | _ -> false)
-                    all_funcs
+                let class_name_str_opt =
+                  match constructor_callee.G.e with
+                  | G.N (G.Id ((class_name, _), _)) -> Some class_name
+                  | _ ->
+                      (match dotted_name_segments_of_expr constructor_callee with
+                      | Some canonical -> List_.last_opt canonical
+                      | None -> None)
                 in
-                (match method_matches with
-                | [ single_match ] -> Some single_match.fn_id
-                | [] -> None
-                | _ -> (
-                    match call_arity with
-                    | Some arity ->
-                        let arity_matches =
-                          List.filter
-                            (fun f -> Int.equal (get_func_arity f.fdef) arity)
-                            method_matches
-                        in
-                        (match arity_matches with
-                        | [ single_match ] -> Some single_match.fn_id
-                        | _ -> None)
-                    | None -> None)))
+                Option.bind class_name_str_opt (fun class_name_str ->
+                    resolve_method_call_in_class class_name_str method_name_str))
         (* Method call: obj.method() - look up obj's class *)
         | _ ->
             Log.debug (fun m ->
