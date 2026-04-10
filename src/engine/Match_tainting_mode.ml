@@ -795,27 +795,27 @@ let collect_fun_info_map ~(lang : Lang.t) ~(ctx : AST_to_IL.ctx)
           | Some ent -> (
               match AST_to_IL.name_of_entity ent with
               | None -> info_map
-              | Some name ->
-                  let class_name_str =
-                    match parent_path with
-                    | Some class_il :: _ -> Some (fst class_il.IL.ident)
-                    | _ -> None
-                  in
-                  let fdef_il =
-                    AST_to_IL.function_definition lang ~ctx fdef
-                  in
-                  let cfg = CFG_build.cfg_of_fdef fdef_il in
-                  let info =
-                    {
-                      name;
-                      class_name_str;
-                      method_properties = [];
-                      cfg;
-                      fdef;
-                      is_lambda_assignment = true;
-                    }
-                  in
-                  add_info info info_map))
+          | Some name ->
+              let class_name_str =
+                match parent_path with
+                | Some class_il :: _ -> Some (fst class_il.IL.ident)
+                | _ -> None
+              in
+              let fdef_il =
+                AST_to_IL.function_definition lang ~ctx fdef
+              in
+              let cfg = CFG_build.cfg_of_fdef fdef_il in
+              let info =
+                {
+                  name;
+                  class_name_str;
+                  method_properties = [];
+                  cfg;
+                  fdef;
+                  is_lambda_assignment = true;
+                }
+              in
+              add_info info info_map))
       | Function
       | Method
       | BlockCases -> (
@@ -1149,99 +1149,7 @@ let check_rule per_file_formula_cache (rule : R.taint_rule) match_hook
            * and added to the signature database after IL conversion *)
 
           (* Collect function metadata and prepare call graph based ordering. *)
-          let add_info info (infos, info_map) =
-            let infos = info :: infos in
-            let info_map =
-              if Shape_and_sig.FunctionMap.mem (Function_id.of_il_name info.name) info_map then info_map
-              else Shape_and_sig.FunctionMap.add (Function_id.of_il_name info.name) info info_map
-            in
-            (infos, info_map)
-          in
-
-          let _collected_infos, info_map =
-            Visit_function_defs.fold_with_parent_path
-              (fun (infos, info_map) opt_ent parent_path fdef ->
-                match fst fdef.fkind with
-                | LambdaKind
-                | Arrow -> (
-                    match opt_ent with
-                    | None -> (infos, info_map)
-                    | Some ent ->
-                        match AST_to_IL.name_of_entity ent with
-                        | None -> (infos, info_map)
-                        | Some name ->
-                            let class_name_str =
-                              match parent_path with
-                              | Some class_il :: _ -> Some (fst class_il.IL.ident)
-                              | _ -> None
-                            in
-                            let fdef_il =
-                              AST_to_IL.function_definition taint_inst.lang
-                                ~ctx fdef
-                            in
-                            let cfg = CFG_build.cfg_of_fdef fdef_il in
-                            let info =
-                              {
-                                name;
-                                class_name_str;
-                                method_properties = [];
-                                cfg;
-                                fdef;
-                                is_lambda_assignment = true;
-                              }
-                            in
-                            add_info info (infos, info_map))
-                | Function
-                | Method
-                | BlockCases -> (
-                    match Option.bind opt_ent AST_to_IL.name_of_entity with
-                    | None -> (infos, info_map)
-                    | Some name ->
-                        (* For Go methods, extract receiver type as class name *)
-                        let go_receiver_name =
-                          match lang with
-                          | Lang.Go ->
-                              Graph_from_AST.extract_go_receiver_type fdef
-                          | _ -> None
-                        in
-                        let class_name_str =
-                          match go_receiver_name with
-                          | Some recv_name -> Some recv_name
-                          | None -> (
-                              match parent_path with
-                              | Some class_il :: _ -> Some (fst class_il.IL.ident)
-                              | _ -> None)
-                        in
-                        let method_properties =
-                          match fst fdef.fkind with
-                          | Method ->
-                              Taint_signature_extractor.extract_method_properties
-                                fdef
-                          | Function
-                          | LambdaKind
-                          | Arrow
-                          | BlockCases ->
-                              []
-                        in
-                        let fdef_il =
-                          AST_to_IL.function_definition taint_inst.lang ~ctx
-                            fdef
-                        in
-                        let cfg = CFG_build.cfg_of_fdef fdef_il in
-                        let info =
-                          {
-                            name;
-                            class_name_str;
-                            method_properties;
-                            cfg;
-                            fdef;
-                            is_lambda_assignment = false;
-                          }
-                        in
-                        add_info info (infos, info_map)))
-              ([], Shape_and_sig.FunctionMap.empty)
-              ast
-          in
+          let info_map = collect_fun_info_map ~lang ~ctx ast in
           (* Use object mappings from Object_initialization.ml *)
           let all_object_mappings = object_mappings in
           let initial_signature_db =
@@ -1276,7 +1184,6 @@ let check_rule per_file_formula_cache (rule : R.taint_rule) match_hook
             Graph_from_AST.find_functions_containing_ranges ~lang ast
               sink_ranges
           in
-
           Log.debug (fun m ->
               m "SUBGRAPH: Found %d source functions and %d sink functions"
                 (List.length source_functions)

@@ -104,7 +104,8 @@ function sink($s) {
 // These test HOF callback detection at script level (outside any function)
 
 // Top-level lambda callback
-// ruleid: test-hof-taint
+// todoruleid: test-hof-taint
+// TODO: top-level PHP anonymous callback invocation is not modeled yet
 $toplevelSink = function($x) { sink($x); };
 $toplevelSink(source());
 

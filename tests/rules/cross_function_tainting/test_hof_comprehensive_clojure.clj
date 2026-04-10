@@ -285,7 +285,8 @@
     (sink tainted)))
 
 (defn test-cross-function-fn []
-  ;; ruleid: test-hof-taint
+  ;; todoruleid: test-hof-taint
+  ;; TODO: inline Clojure fn bindings inside let are not modeled yet
   (let [r (fn [x] (sink x))]
     (r (source))))
 

@@ -128,6 +128,10 @@ type env = {
       *)
 }
 
+let infer_lambda_signature_on_demand :
+    (env -> IL.name -> IL.function_definition -> Signature.t option) ref =
+  ref (fun _env _lambda_name _lambda_fdef -> None)
+
 (*****************************************************************************)
 (* Hooks *)
 (*****************************************************************************)
@@ -706,6 +710,26 @@ let lookup_signature_with_object_context env fun_exp arity =
       Log.debug (fun m -> m "TAINT_SIG: No signature database available");
       None
   | Some db -> (
+      let or_else opt fallback =
+        match opt with
+        | Some _ -> opt
+        | None -> fallback
+      in
+      let should_fallback_by_text_name name =
+        Tok.is_fake (snd name.ident)
+      in
+      let lookup_direct_or_by_name name =
+        let func_name = fst name.ident in
+        let direct =
+          Shape_and_sig.lookup_signature db (Function_id.of_il_name name) arity
+        in
+        if should_fallback_by_text_name name then
+          direct
+          |> or_else
+               (Shape_and_sig.lookup_signature_by_text_name db ~name:func_name
+                  arity)
+        else direct
+      in
       match fun_exp.e with
       | Fetch { base = Var name; rev_offset = [] } ->
           (* Simple function call *)
@@ -726,10 +750,10 @@ let lookup_signature_with_object_context env fun_exp arity =
               (* Graph lookup failed - try class context or direct lookup *)
               match env.class_name with
               | Some _ ->
-                  Shape_and_sig.lookup_signature db (Function_id.of_il_name name) arity
+                  lookup_direct_or_by_name name
               | None ->
                   let func_name = fst name.ident in
-                  let result = Shape_and_sig.lookup_signature db (Function_id.of_il_name name) arity in
+                  let result = lookup_direct_or_by_name name in
                   try_builtin_fallback env func_name arity result)
       | Fetch ({ base = Var _; rev_offset = _ :: _ :: _ } as lval) -> (
           match dotted_fetch_path lval with
@@ -759,11 +783,7 @@ let lookup_signature_with_object_context env fun_exp arity =
                           id_info = last_name.id_info;
                         }
                       in
-                      let result =
-                        Shape_and_sig.lookup_signature db
-                          (Function_id.of_il_name qualified_name)
-                          arity
-                      in
+                      let result = lookup_direct_or_by_name qualified_name in
                       let result =
                         try_builtin_fallback env qualified_name_str arity result
                       in
@@ -792,7 +812,7 @@ let lookup_signature_with_object_context env fun_exp arity =
           | Some callee_node ->
               Shape_and_sig.(lookup_signature db callee_node arity)
           | None ->
-              Shape_and_sig.lookup_signature db (Function_id.of_il_name method_name) arity)
+              lookup_direct_or_by_name method_name)
       | Fetch { base = Var obj; rev_offset = [ { o = Dot method_name; _ } ] } -> (
           match
             get_signature_for_object
@@ -813,7 +833,7 @@ let lookup_signature_with_object_context env fun_exp arity =
                   id_info = method_name.id_info;
                 }
               in
-              let result = Shape_and_sig.lookup_signature db (Function_id.of_il_name qualified_name) arity in
+              let result = lookup_direct_or_by_name qualified_name in
               (* Try builtin fallback - first with qualified name, then with just method name *)
               let result = try_builtin_fallback env (fst qualified_name.ident) arity result in
               try_builtin_fallback env (fst method_name.ident) arity result)
@@ -916,7 +936,7 @@ let check_orig_if_sink env ?filter_sinks orig taints shape =
    * A sink is something opaque to us, e.g. consider sink(["ok", "tainted"]),
    * `sink` could potentially access "tainted". So we must take into account
    * all taints reachable through its shape.
-   *)
+  *)
   let taints = taints |> add_taints_from_shape shape in
   let sinks = orig_is_best_sink env orig in
   let sinks =
@@ -2276,7 +2296,11 @@ let check_tainted_instr env instr : Taints.t * S.shape * Lval_env.t =
             match (lval.base, env.signature_db, anon_entity) with
             | Var lambda_name, Some db, Lambda fdef ->
                 let arity = List.length fdef.fparams in
-                (match Shape_and_sig.lookup_signature db (Function_id.of_il_name lambda_name) arity with
+                let sig_opt =
+                  Shape_and_sig.lookup_signature db
+                    (Function_id.of_il_name lambda_name) arity
+                in
+                (match sig_opt with
                 | Some sig_ ->
                     let fun_shape = S.Fun sig_ in
                     Log.debug (fun m ->
@@ -2285,10 +2309,21 @@ let check_tainted_instr env instr : Taints.t * S.shape * Lval_env.t =
                           (S.show_shape fun_shape));
                     (Taints.empty, fun_shape, env.lval_env)
                 | None ->
-                    Log.debug (fun m ->
-                        m "AssignAnon: lambda %s has no signature in db"
-                          (IL.str_of_name lambda_name));
-                    (Taints.empty, Bot, env.lval_env))
+                    (match !infer_lambda_signature_on_demand env lambda_name fdef with
+                    | Some sig_ ->
+                        let fun_shape = S.Fun sig_ in
+                        Log.debug (fun m ->
+                            m
+                              "AssignAnon: inferred lambda %s signature on \
+                               demand as %s"
+                              (IL.str_of_name lambda_name)
+                              (S.show_shape fun_shape));
+                        (Taints.empty, fun_shape, env.lval_env)
+                    | None ->
+                        Log.debug (fun m ->
+                            m "AssignAnon: lambda %s has no signature in db"
+                              (IL.str_of_name lambda_name));
+                        (Taints.empty, Bot, env.lval_env)))
             | _, _, _ -> (Taints.empty, Bot, env.lval_env))
         | AnonClass _cdef ->
             (* Anonymous class instantiations are detected by Object_initialization.ml
@@ -3103,3 +3138,99 @@ and (fixpoint :
 let fixpoint taint_inst ?in_env ?name ?class_name ?signature_db ?builtin_signature_db ?call_graph fun_cfg =
   fixpoint taint_inst ?in_env ?name ?class_name ?signature_db ?builtin_signature_db ?call_graph fun_cfg
 [@@profiling]
+
+let () =
+  infer_lambda_signature_on_demand :=
+    (fun env lambda_name lambda_fdef ->
+      try
+        let lambda_cfg = CFG_build.cfg_of_fdef lambda_fdef in
+        let params = Signature.of_IL_params lambda_cfg.params in
+        let param_assumptions =
+          let _, env_with_params =
+            lambda_cfg.params
+            |> List.fold_left
+                 (fun (i, acc_env) param ->
+                   match param with
+                   | IL.Param { pname; _ }
+                   | IL.ParamRest { pname; _ } ->
+                       let il_lval : IL.lval =
+                         { base = Var pname; rev_offset = [] }
+                       in
+                       let taint_arg : Taint.arg =
+                         { name = fst pname.ident; index = i }
+                       in
+                       let taint_lval : Taint.lval =
+                         { base = BArg taint_arg; offset = [] }
+                       in
+                       let generic_taint =
+                         Taint.{ orig = Var taint_lval; tokens = [] }
+                       in
+                       let taint_set =
+                         Taint.Taint_set.singleton generic_taint
+                       in
+                       let param_shape = S.Arg taint_arg in
+                       let next_env =
+                         Lval_env.add_lval_shape il_lval taint_set param_shape
+                           acc_env
+                       in
+                       (i + 1, next_env)
+                   | IL.ParamPattern _
+                   | IL.ParamFixme ->
+                       (i + 1, acc_env))
+                 (0, Lval_env.empty)
+          in
+          env_with_params
+        in
+        let combined_env =
+          Lval_env.union env.lval_env param_assumptions
+        in
+        let lambda_best_matches =
+          lambda_cfg
+          |> TM.best_matches_in_nodes ~sub_matches_of_orig:(fun orig ->
+                 let sources =
+                   orig_is_source env.taint_inst orig
+                   |> List.to_seq
+                   |> Seq.filter (fun (m : R.taint_source TM.t) ->
+                          m.spec.source_exact)
+                   |> Seq.map (fun m -> TM.Any m)
+                 in
+                 let sanitizers =
+                   orig_is_sanitizer env.taint_inst orig
+                   |> List.to_seq
+                   |> Seq.filter (fun (m : R.taint_sanitizer TM.t) ->
+                          m.spec.sanitizer_exact)
+                   |> Seq.map (fun m -> TM.Any m)
+                 in
+                 let sinks =
+                   orig_is_sink env.taint_inst orig
+                   |> List.to_seq
+                   |> Seq.filter (fun (m : R.taint_sink TM.t) ->
+                          m.spec.sink_exact)
+                   |> Seq.map (fun m -> TM.Any m)
+                 in
+                 sources |> Seq.append sanitizers |> Seq.append sinks)
+        in
+        let lambda_func =
+          {
+            name = Some lambda_name;
+            best_matches = lambda_best_matches;
+            used_lambdas = IL.NameSet.empty;
+          }
+        in
+        let lambda_effects, _mapping =
+          fixpoint_aux env.taint_inst lambda_func
+            ~enter_lval_env:combined_env
+            ~in_lambda:(Some lambda_name) ~class_name:None
+            ?signature_db:env.signature_db
+            ?builtin_signature_db:env.builtin_signature_db
+            ?call_graph:env.call_graph lambda_cfg
+        in
+        Some { Signature.params; effects = lambda_effects }
+      with
+      | e ->
+          Log.debug (fun m ->
+              m
+                "Failed to infer lambda %s signature on demand: %s"
+                (IL.str_of_name lambda_name)
+                (Common.exn_to_s e));
+          None)

@@ -560,6 +560,25 @@ let fn_id_of_entity ~(lang : Lang.t) (opt_ent : G.entity option)
       } in
       Some (normalized_parent_path @ [Some tmp_name])
 
+let anonymous_tmp_name_of_fdef (fdef : G.function_definition) : IL.name =
+  let tok = match fdef.fkind with (_, tok) -> tok in
+  let fake_tok = Tok.fake_tok tok "_tmp" in
+  IL.
+    {
+      ident = ("_tmp", fake_tok);
+      sid = G.SId.unsafe_default;
+      id_info = G.empty_id_info ();
+    }
+
+let anonymous_fn_id_of_fdef (parent_path : IL.name option list)
+    (fdef : G.function_definition) : fn_id =
+  let normalized_parent_path =
+    match parent_path with
+    | [] -> [None]
+    | path -> path
+  in
+  normalized_parent_path @ [Some (anonymous_tmp_name_of_fdef fdef)]
+
 let dedup_fn_ids (ids : (fn_id * Tok.t) list) : (fn_id * Tok.t) list =
   ids |>
   List.sort_uniq (fun (f1, t1) (f2, t2) ->
@@ -1186,6 +1205,9 @@ let try_identify_callback_arg ~all_funcs ~caller_parent_path
     ?(current_file : Fpath.t option) (arg : G.argument) :
     (fn_id * Tok.t * IL.name option) option =
   match arg with
+  | G.Arg { G.e = G.Lambda fdef; _ } ->
+      let tok = match fdef.fkind with (_, tok) -> tok in
+      Some (anonymous_fn_id_of_fdef caller_parent_path fdef, tok, None)
   | G.Arg expr ->
       (* Also handle this.foo pattern *)
       let callback_opt = match expr.G.e with
@@ -1226,8 +1248,14 @@ let extract_hof_callbacks_from_call ~method_hofs ~function_hofs ~all_funcs
   let configured_callbacks = match callee.G.e with
   (* Method HOF: arr.map(callback) - callback at index 0 *)
   | G.DotAccess (_, _, G.FN (G.Id ((method_name, _), _)))
-    when List.mem method_name method_hofs ->
-      try_arg_at_index 0 |> Option.to_list
+    -> (
+      match
+        List.find_opt (fun (methods, _) -> List.mem method_name methods)
+          method_hofs
+      with
+      | Some (_, callback_index) ->
+          try_arg_at_index callback_index |> Option.to_list
+      | None -> [])
   (* Function HOF: map(callback, arr) *)
   | G.N (G.Id (id, _id_info)) ->
       let func_name = fst id in
@@ -1248,8 +1276,9 @@ let extract_hof_callbacks ?(_object_mappings = []) ?(all_funcs = [])
   let hof_configs = (Lang_config.get lang).hof_configs in
   let method_hofs =
     hof_configs |> List.concat_map (function
-      | Lang_config.MethodHOF { methods; _ } -> methods
-      | Lang_config.ReturningFunctionHOF { methods; _ } -> methods
+      | Lang_config.MethodHOF { methods; callback_index; _ } ->
+          [ (methods, callback_index) ]
+      | Lang_config.ReturningFunctionHOF { methods; _ } -> [ (methods, 0) ]
       | _ -> [])
   in
   let function_hofs =
@@ -1421,8 +1450,9 @@ let build_call_graph_with_context ~(lang : Lang.t) ?(object_mappings = [])
     let hof_configs = (Lang_config.get lang).hof_configs in
     let method_hofs =
       hof_configs |> List.concat_map (function
-        | Lang_config.MethodHOF { methods; _ } -> methods
-        | Lang_config.ReturningFunctionHOF { methods; _ } -> methods
+        | Lang_config.MethodHOF { methods; callback_index; _ } ->
+            [ (methods, callback_index) ]
+        | Lang_config.ReturningFunctionHOF { methods; _ } -> [ (methods, 0) ]
         | _ -> [])
     in
     let function_hofs =
@@ -1791,6 +1821,18 @@ let find_functions_containing_ranges ~(lang : Lang.t)
       | G.EN name -> self#g_name_to_il_name name
       | _ -> None
 
+    method private record_function_range (fn_id : fn_id) (range : Range.t) =
+      let func_start = range.start in
+      let func_end = range.end_ in
+      let func_size = func_end - func_start in
+      List.iter (fun (range : Range.t) ->
+        if func_start <= range.Range.start && range.Range.end_ <= func_end then (
+          let existing = Hashtbl.find range_to_funcs range in
+          if not (List.exists (fun (fid, _) -> equal_fn_id fid fn_id) existing) then
+            Hashtbl.replace range_to_funcs range ((fn_id, func_size) :: existing)
+        )
+      ) ranges
+
     method! visit_definition (env : unit) ((ent, def_kind) as def) =
       match def_kind with
       | G.ClassDef cdef ->
@@ -1836,29 +1878,15 @@ let find_functions_containing_ranges ~(lang : Lang.t)
           (match func_range_opt with
           | Some (loc_start, loc_end) ->
               let range = Range.range_of_token_locations loc_start loc_end in
-              let func_start = range.start in
-              let func_end = range.end_ in
-              let func_size = func_end - func_start in
-
-              (* For each range, check if it's inside this function *)
-              List.iter (fun (range : Range.t) ->
-                if func_start <= range.Range.start && range.Range.end_ <= func_end then (
-                  (* This function contains this range - add it to the list *)
-                  (* Use proper parent_path tracking for nested functions *)
-                  let class_il = Option.bind !current_class self#g_name_to_il_name in
-                  let visitor_parent_path =
-                    match !parent_path with
-                    | [] -> [class_il]
-                    | _ -> !parent_path
-                  in
-                  match fn_id_of_entity ~lang (Some ent) visitor_parent_path fdef with
-                  | Some fn_id ->
-                      let existing = Hashtbl.find range_to_funcs range in
-                      if not (List.exists (fun (fid, _) -> equal_fn_id fid fn_id) existing) then
-                        Hashtbl.replace range_to_funcs range ((fn_id, func_size) :: existing)
-                  | None -> ()
-                )
-              ) ranges;
+              let class_il = Option.bind !current_class self#g_name_to_il_name in
+              let visitor_parent_path =
+                match !parent_path with
+                | [] -> [class_il]
+                | _ -> !parent_path
+              in
+              (match fn_id_of_entity ~lang (Some ent) visitor_parent_path fdef with
+              | Some fn_id -> self#record_function_range fn_id range
+              | None -> ());
 
               (* Push current function onto parent_path for nested functions *)
               let old_path = !parent_path in
@@ -1871,13 +1899,16 @@ let find_functions_containing_ranges ~(lang : Lang.t)
               in
               parent_path := current_fn_id;
 
-              (* Visit nested functions with updated parent_path *)
-              super#visit_definition env def;
+              (* Visit nested functions with updated parent_path without re-visiting
+                 the outer lambda/function expression itself. *)
+              let body = AST_generic_helpers.funcbody_to_stmt fdef.G.fbody in
+              self#visit_stmt env body;
 
               (* Restore parent_path *)
               parent_path := old_path
           | None -> super#visit_definition env def)
       | _ -> super#visit_definition env def
+
   end in
 
   visitor#visit_program () ast;

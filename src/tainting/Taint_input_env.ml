@@ -80,10 +80,16 @@ let add_to_env taint_inst (env, effects) id id_info opt_expr =
 let mk_fun_input_env taint_inst ?(glob_env = Taint_lval_env.empty)
     (fparams : IL.param list) =
   let add_to_env = add_to_env taint_inst in
-  fparams
-  (* For each argument, check if it's a source and, if so, add it to the input
+  let env, effects =
+    fparams
+    (* For each argument, check if it's a source and, if so, add it to the input
      * environment. *)
-  |> Fold_IL_params.fold add_to_env (glob_env, Effects.empty)
+    |> Fold_IL_params.fold add_to_env (glob_env, Effects.empty)
+  in
+  let param_assumptions =
+    Taint_signature_extractor.mk_param_assumptions ~taint_inst fparams
+  in
+  (Taint_lval_env.union env param_assumptions, effects)
 
 let is_global (id_info : G.id_info) =
   let* kind, _sid = !(id_info.id_resolved) in
