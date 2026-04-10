@@ -243,6 +243,39 @@ def filter_dependency_aware_rules(
     return filtered_rules
 
 
+def get_reusable_interfile_scan_plan(
+    engine_type: EngineType,
+    target_mode_config: TargetModeConfig,
+    rules_for_core: Sequence[Rule],
+    scan_plans: Sequence[Plan],
+) -> Optional[Plan]:
+    """
+    Reuse the already-built pre-scan SAST plan when it exactly matches the
+    rule set that will be executed by the interfile engine.
+
+    This keeps the optimization narrow and reversible:
+    - only interfile scans use it
+    - differential and historical scans keep their existing plan-building path
+    - any rule-set mismatch falls back to rebuilding the execution plan
+    """
+    if (
+        not engine_type.is_interfile
+        or target_mode_config.is_pro_diff_scan
+        or target_mode_config.is_historical_scan
+        or not scan_plans
+    ):
+        return None
+
+    sast_plan = scan_plans[0]
+    pre_scan_rule_ids = tuple(rule.id for rule in sast_plan.rules)
+    core_rule_ids = tuple(rule.id for rule in rules_for_core)
+
+    if pre_scan_rule_ids != core_rule_ids:
+        return None
+
+    return sast_plan
+
+
 # This runs semgrep-core (and also handles SCA and join rules)
 @tracing.trace()
 def run_rules(
@@ -353,6 +386,12 @@ def run_rules(
         with_code_rules=with_code_rules,
         with_supply_chain=with_supply_chain,
     )
+    reusable_interfile_plan = get_reusable_interfile_scan_plan(
+        engine_type,
+        target_mode_config,
+        rest_of_the_rules,
+        plans,
+    )
 
     # Dispatching to semgrep-core!
     (
@@ -373,6 +412,7 @@ def run_rules(
         resolved_subprojects,
         opengrep_ignore_pattern=opengrep_ignore_pattern,
         bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
+        precomputed_plan=reusable_interfile_plan,
         inline_metavariables=inline_metavariables,
         max_match_per_file=max_match_per_file,
         allow_rule_timeout_control=allow_rule_timeout_control,
