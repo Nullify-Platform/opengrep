@@ -479,54 +479,58 @@ let pms_of_effect ~match_on (effect_ : Effect.t) =
       let actual_taints = List_.map (fun t -> t.Effect.taint) taints in
       let satisfies = T.taints_satisfy_requires actual_taints requires in
       if not satisfies then []
-      else
+      else (
         let preferred_label = preferred_label_of_sink sink in
-        let taint_sources = sources_of_taints ?preferred_label taints in
-        match match_on with
-        | `Sink ->
-            (* The old behavior used to be that, for sinks with a `requires`, we would
-               generate a finding per every single taint source going in. Later deduplication
-               would deal with it.
-               We will instead choose to consolidate all sources into a single finding. We can
-               do some postprocessing to report only relevant sources later on, but for now we
-               will lazily (again) defer that computation to later.
-            *)
-            let traces = List_.map trace_of_source taint_sources in
-            (* We always report the finding on the sink that gets tainted, the call trace
-                * must be used to explain how exactly the taint gets there. At some point
-                * we experimented with reporting the match on the `sink`'s function call that
-                * leads to the actual sink. E.g.:
-                *
-                *     def f(x):
-                *       sink(x)
-                *
-                *     def g():
-                *       f(source)
-                *
-                * Here we tried reporting the match on `f(source)` as "the line to blame"
-                * for the injection bug... but most users seem to be confused about this. They
-                * already expect Semgrep (and DeepSemgrep) to report the match on `sink(x)`.
-            *)
-            let taint_trace = Some (lazy traces) in
-            [ { sink_pm with env = merged_env; taint_trace } ]
-        | `Source ->
-            taint_sources
-            |> List_.map (fun source ->
-                   let src, tokens, sink_trace = source in
-                   let src_pm, _ = T.pm_of_trace src.T.call_trace in
-                   let trace =
-                     {
-                       Taint_trace.source_trace =
-                         convert_taint_call_trace src.T.call_trace;
-                       tokens;
-                       sink_trace = convert_taint_call_trace sink_trace;
-                     }
-                   in
-                   {
-                     src_pm with
-                     env = merged_env;
-                     taint_trace = Some (lazy [ trace ]);
-                   }))
+        match sources_of_taints ?preferred_label taints with
+        | [] -> []
+        | taint_sources -> (
+            match match_on with
+            | `Sink ->
+                (* The old behavior used to be that, for sinks with a `requires`, we would
+                   generate a finding per every single taint source going in. Later deduplication
+                   would deal with it.
+                   We will instead choose to consolidate all sources into a single finding. We can
+                   do some postprocessing to report only relevant sources later on, but for now we
+                   will lazily (again) defer that computation to later.
+                *)
+                let traces = List_.map trace_of_source taint_sources in
+                (* We always report the finding on the sink that gets tainted, the call trace
+                    * must be used to explain how exactly the taint gets there. At some point
+                    * we experimented with reporting the match on the `sink`'s function call that
+                    * leads to the actual sink. E.g.:
+                    *
+                    *     def f(x):
+                    *       sink(x)
+                    *
+                    *     def g():
+                    *       f(source)
+                    *
+                    * Here we tried reporting the match on `f(source)` as "the line to blame"
+                    * for the injection bug... but most users seem to be confused about this. They
+                    * already expect Semgrep (and DeepSemgrep) to report the match on `sink(x)`.
+                *)
+                let taint_trace = Some (lazy traces) in
+                [ { sink_pm with env = merged_env; taint_trace } ]
+            | `Source ->
+                taint_sources
+                |> List_.map (fun source ->
+                       let src, tokens, sink_trace = source in
+                       let src_pm, _ = T.pm_of_trace src.T.call_trace in
+                       let trace =
+                         {
+                           Taint_trace.source_trace =
+                             convert_taint_call_trace src.T.call_trace;
+                           tokens;
+                           sink_trace = convert_taint_call_trace sink_trace;
+                         }
+                       in
+                       {
+                         src_pm with
+                         env = merged_env;
+                         taint_trace = Some (lazy [ trace ]);
+                       }))
+        )
+      )
 
 (*****************************************************************************)
 (* Main entry points *)
@@ -1312,9 +1316,22 @@ let check_rule per_file_formula_cache (rule : R.taint_rule) match_hook
               initial_signature_db analysis_order
           in
 
-          (* Skip the "remaining functions" phase entirely - if a function isn't
-             in the relevant subgraph, we don't need to analyze it *)
-          let final_signature_db = signature_db_after_order in
+          let final_signature_db =
+            Shape_and_sig.FunctionMap.fold
+              (fun fn_id info db ->
+                if
+                  Shape_and_sig.FunctionMap.mem fn_id
+                    db.Shape_and_sig.signatures
+                then db
+                else
+                  (* Keep the relevance-filtered pass for performance, but add
+                     missing signatures from the full graph. Top-level direct
+                     calls and callback sources can otherwise be skipped because
+                     the call graph is oriented callee -> caller. *)
+                  add_signatures_for_fun_info ~lang ~ctx ~taint_inst ~ast
+                    ?builtin_signature_db ~call_graph info db)
+              info_map signature_db_after_order
+          in
           (Some final_signature_db, Some relevant_graph, false))
         | None ->
           (* Cross-function taint analysis disabled: use main branch behavior *)

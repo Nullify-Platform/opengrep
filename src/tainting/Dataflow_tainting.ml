@@ -715,20 +715,15 @@ let lookup_signature_with_object_context env fun_exp arity =
         | Some _ -> opt
         | None -> fallback
       in
-      let should_fallback_by_text_name name =
-        Tok.is_fake (snd name.ident)
-      in
       let lookup_direct_or_by_name name =
         let func_name = fst name.ident in
         let direct =
           Shape_and_sig.lookup_signature db (Function_id.of_il_name name) arity
         in
-        if should_fallback_by_text_name name then
-          direct
-          |> or_else
-               (Shape_and_sig.lookup_signature_by_text_name db ~name:func_name
-                  arity)
-        else direct
+        direct
+        |> or_else
+             (Shape_and_sig.lookup_signature_by_text_name db ~name:func_name
+                arity)
       in
       match fun_exp.e with
       | Fetch { base = Var name; rev_offset = [] } ->
@@ -2689,18 +2684,20 @@ let rec transfer : env -> fun_cfg:F.fun_cfg -> Lval_env.t D.transfn =
         begin
           match opt_lval with
           | Some lval ->
+              let lval_taints_changed =
+                not (Lval_env.equal_by_lval in' lval_env' lval)
+              in
               if Shape.taints_and_shape_are_relevant taints shape then
-                (* Instruction returns tainted data, add taints to lval.
-                 * See [Taint_lval_env] for details. *)
+                (* Assignments replace the previous binding. If this instruction
+                   did not already change the lval by side-effect, clear the old
+                   binding before writing the RHS so stale taint from previous
+                   iterations/rebindings does not survive through unification. *)
+                let lval_env' =
+                  if lval_taints_changed then lval_env'
+                  else Lval_env.clean lval_env' lval
+                in
                 lval_env' |> Lval_env.add_lval_shape lval taints shape
               else
-                (* The RHS returns no taint, but taint could propagate by
-                 * side-effect too. So, we check whether the taint assigned
-                 * to 'lval' has changed to determine whether we need to
-                 * clean 'lval' or not. *)
-                let lval_taints_changed =
-                  not (Lval_env.equal_by_lval in' lval_env' lval)
-                in
                 if lval_taints_changed then
                   (* The taint of 'lval' has changed, so there was a source or
                    * sanitizer acting by side-effect on this instruction. Thus we do NOT

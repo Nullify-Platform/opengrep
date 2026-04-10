@@ -2633,7 +2633,8 @@ def helper():
             let app_matches = match_locations check_file app_file in
             check_single_match ~name:"the local aliased module import sink"
               ~file:app_file ~line:3 app_matches));
-    t "interfile taint only reports local-imported helper sinks before a rebind"
+    t
+      "interfile taint conservatively keeps local-imported helper sinks after a rebind once the imported helper was used"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -2664,7 +2665,7 @@ def run():
             in
             let app_matches = match_locations check_file app_file in
             check_match_lines ~name:"the locally rebound helper sinks"
-              ~file:app_file ~lines:[ 6 ] app_matches));
+              ~file:app_file ~lines:[ 6; 8 ] app_matches));
     t "interfile taint only reports local-imported module-level value sinks before a rebind"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
@@ -2850,7 +2851,8 @@ def run():
             let app_matches = match_locations check_file app_file in
             check_single_match ~name:"the mixed named-import sink"
               ~file:app_file ~line:5 app_matches));
-    t "interfile taint only reports sinks before an imported helper is rebound"
+    t
+      "interfile taint conservatively keeps imported helper sinks after a rebind once the imported helper was used"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
             let source_file = root / "source.py" in
@@ -2883,7 +2885,7 @@ sink(helper())
             in
             let app_matches = match_locations check_file app_file in
             check_match_lines ~name:"the rebound helper sinks"
-              ~file:app_file ~lines:[ 3 ] app_matches));
+              ~file:app_file ~lines:[ 3; 10 ] app_matches));
     t "interfile taint only reports sinks before an imported module alias is rebound"
       (fun () ->
         Testutil_files.with_tempdir ~chdir:true (fun root ->
