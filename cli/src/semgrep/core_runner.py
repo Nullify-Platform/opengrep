@@ -793,6 +793,7 @@ class CoreRunner:
         sca_subprojects: Dict[out.Ecosystem, List[ResolvedSubproject]],
         opengrep_ignore_pattern: Optional[str],
         bypass_includes_excludes_for_files: bool = True,
+        precomputed_plan: Optional[Plan] = None,
         inline_metavariables: bool = False,
         max_match_per_file: Optional[int] = None,
         allow_rule_timeout_control: bool = DEFAULT_ALLOW_RULE_TIMEOUT_CONTROL,
@@ -900,18 +901,18 @@ Could not find the semgrep-core executable. Your Semgrep install is likely corru
                 # commits as "diff targets". To compile a comprehensive list of all input files
                 # for `plan`, the `baseline_handler` is disabled within the `target_manager`
                 # when executing `plan_core_run`.
-                plan = self.plan_core_run(
-                    rules,
-                    evolve(target_manager, baseline_handler=None),
-                    all_targets=all_targets,
-                    sca_subprojects=sca_subprojects,
-                    bypass_includes_excludes_for_files=bypass_includes_excludes_for_files
-                )
+                plan_target_manager = evolve(target_manager, baseline_handler=None)
 
+            else:
+                plan_target_manager = target_manager
+
+            if precomputed_plan is not None:
+                plan = precomputed_plan
+                all_targets.update(Path(task.path) for task in plan.target_mappings)
             else:
                 plan = self.plan_core_run(
                     rules,
-                    target_manager,
+                    plan_target_manager,
                     all_targets=all_targets,
                     sca_subprojects=sca_subprojects,
                     bypass_includes_excludes_for_files=bypass_includes_excludes_for_files
@@ -1134,6 +1135,7 @@ Could not find the semgrep-core executable. Your Semgrep install is likely corru
         sca_subprojects: Dict[out.Ecosystem, List[ResolvedSubproject]],
         opengrep_ignore_pattern: Optional[str] = None,
         bypass_includes_excludes_for_files: bool = True,
+        precomputed_plan: Optional[Plan] = None,
         inline_metavariables: bool = False,
         max_match_per_file: Optional[int] = None,
         allow_rule_timeout_control: bool = DEFAULT_ALLOW_RULE_TIMEOUT_CONTROL,
@@ -1165,6 +1167,7 @@ Could not find the semgrep-core executable. Your Semgrep install is likely corru
                 sca_subprojects,
                 opengrep_ignore_pattern=opengrep_ignore_pattern,
                 bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
+                precomputed_plan=precomputed_plan,
                 inline_metavariables=inline_metavariables,
                 max_match_per_file=max_match_per_file,
                 allow_rule_timeout_control=allow_rule_timeout_control,
@@ -1214,6 +1217,7 @@ Exception raised: `{e}`
         sca_subprojects: Dict[out.Ecosystem, List[ResolvedSubproject]],
         opengrep_ignore_pattern: Optional[str] = None,
         bypass_includes_excludes_for_files: bool = True,
+        precomputed_plan: Optional[Plan] = None,
         inline_metavariables: bool = False,
         max_match_per_file: Optional[int] = None,
         allow_rule_timeout_control: bool = DEFAULT_ALLOW_RULE_TIMEOUT_CONTROL,
@@ -1245,6 +1249,7 @@ Exception raised: `{e}`
             sca_subprojects,
             opengrep_ignore_pattern=opengrep_ignore_pattern,
             bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
+            precomputed_plan=precomputed_plan,
             inline_metavariables = inline_metavariables,
             max_match_per_file=max_match_per_file,
             allow_rule_timeout_control=allow_rule_timeout_control,
