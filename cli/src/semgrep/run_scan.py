@@ -352,6 +352,7 @@ def run_rules(
         cli_ux=cli_ux,
         with_code_rules=with_code_rules,
         with_supply_chain=with_supply_chain,
+        bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
     )
 
     # Dispatching to semgrep-core!

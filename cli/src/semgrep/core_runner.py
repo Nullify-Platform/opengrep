@@ -7,6 +7,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from weakref import WeakKeyDictionary
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -19,6 +20,7 @@ from typing import Set
 from typing import Tuple
 
 from attr import evolve
+from attr import frozen
 from rich.progress import BarColumn
 from rich.progress import Progress
 from rich.progress import TaskID
@@ -77,6 +79,47 @@ LARGE_READ_SIZE: int = 1024 * 1024 * 512
 
 if not IS_WINDOWS:
     import resource
+
+
+RuleTargetingSignature = Tuple[
+    Tuple[str, ...],
+    Tuple[str, ...],
+    Tuple[str, ...],
+    str,
+    str,
+]
+PlanBundleCacheKey = Tuple[bool, Tuple[RuleTargetingSignature, ...]]
+
+
+@frozen
+class PlanBundle:
+    tasks: Tuple[Task, ...]
+    unused_rule_nums: Tuple[int, ...]
+
+
+# Reuse the bundled rule-to-target plan inside a single CLI invocation. This is
+# especially useful when the scan status path warms the bundle before the actual
+# engine run, because the interfile scan can then reuse it entirely from memory.
+_PLAN_BUNDLE_CACHE: "WeakKeyDictionary[TargetManager, Dict[PlanBundleCacheKey, PlanBundle]]" = WeakKeyDictionary()
+
+
+def _rule_targeting_signature(rule: Rule) -> RuleTargetingSignature:
+    return (
+        tuple(str(language) for language in rule.languages),
+        tuple(rule.includes),
+        tuple(rule.excludes),
+        rule.id,
+        rule.product.to_json_string(),
+    )
+
+
+def _plan_bundle_cache_key(
+    rules: Sequence[Rule], bypass_includes_excludes_for_files: bool
+) -> PlanBundleCacheKey:
+    return (
+        bypass_includes_excludes_for_files,
+        tuple(_rule_targeting_signature(rule) for rule in rules),
+    )
 
 
 def setrlimits_preexec_fn() -> None:
@@ -731,46 +774,68 @@ class CoreRunner:
 
         Note: this is a list because a target can appear twice (e.g. Java + Generic)
         """
-        # The range of target_info is (index into rules x product as json)
-        # Using product as JSON because we want structural equality of products instead of object equality.
-        target_info: Dict[
-            Tuple[Path, Language], Tuple[List[int], Set[str]]
-        ] = collections.defaultdict(lambda: (list(), set()))
+        cache_key = _plan_bundle_cache_key(
+            rules, bypass_includes_excludes_for_files
+        )
+        bundle_cache = _PLAN_BUNDLE_CACHE.setdefault(target_manager, {})
+        bundle = bundle_cache.get(cache_key)
 
-        unused_rules = []
+        if bundle is None:
+            # The range of target_info is (index into rules x product as json)
+            # Using product as JSON because we want structural equality of products instead of object equality.
+            target_info: Dict[
+                Tuple[Path, Language], Tuple[List[int], Set[str]]
+            ] = collections.defaultdict(lambda: (list(), set()))
 
-        for rule_num, rule in enumerate(rules):
-            any_target = False
-            for language in rule.languages:
-                targets = list(
-                    target_manager.get_files_for_rule(
-                        language, rule.includes, rule.excludes, rule.id, rule.product,
-                        bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
+            unused_rule_nums: List[int] = []
+
+            for rule_num, rule in enumerate(rules):
+                any_target = False
+                for language in rule.languages:
+                    targets = list(
+                        target_manager.get_files_for_rule(
+                            language,
+                            rule.includes,
+                            rule.excludes,
+                            rule.id,
+                            rule.product,
+                            bypass_includes_excludes_for_files=bypass_includes_excludes_for_files,
+                        )
                     )
-                )
-                any_target = any_target or len(targets) > 0
+                    any_target = any_target or len(targets) > 0
 
-                for target in targets:
-                    if all_targets is not None:
-                        all_targets.add(target)
-                    rules_nums, products = target_info[target, language]
-                    rules_nums.append(rule_num)
-                    products.add(rule.product.to_json_string())
+                    for target in targets:
+                        rules_nums, products = target_info[target, language]
+                        rules_nums.append(rule_num)
+                        products.add(rule.product.to_json_string())
 
-            if not any_target:
-                unused_rules.append(rule)
+                if not any_target:
+                    unused_rule_nums.append(rule_num)
+
+            bundle = PlanBundle(
+                tasks=tuple(
+                    Task(
+                        path=target,
+                        analyzer=language,
+                        products=tuple(
+                            out.Product.from_json_string(x) for x in products
+                        ),
+                        # tuple conversion makes rule_nums hashable, so usable as cache key
+                        rule_nums=tuple(rule_nums),
+                    )
+                    for ((target, language), (rule_nums, products)) in target_info.items()
+                ),
+                unused_rule_nums=tuple(unused_rule_nums),
+            )
+            bundle_cache[cache_key] = bundle
+
+        if all_targets is not None:
+            all_targets.update(Path(task.path) for task in bundle.tasks)
+
+        unused_rules = [rules[rule_num] for rule_num in bundle.unused_rule_nums]
 
         return Plan(
-            [
-                Task(
-                    path=target,
-                    analyzer=language,
-                    products=tuple(out.Product.from_json_string(x) for x in products),
-                    # tuple conversion makes rule_nums hashable, so usable as cache key
-                    rule_nums=tuple(rule_nums),
-                )
-                for ((target, language), (rule_nums, products)) in target_info.items()
-            ],
+            list(bundle.tasks),
             rules,
             product=product,
             sca_subprojects=sca_subprojects,
