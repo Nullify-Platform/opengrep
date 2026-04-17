@@ -4,8 +4,7 @@ function test() {
         req.on('data', function (chunk) {
             buf += chunk
         });
-        // todoruleid: test
-        // TODO: callback writes through captured outer variables are not modeled yet.
+        // ruleid: test
         sink(buf);
     };
 }
