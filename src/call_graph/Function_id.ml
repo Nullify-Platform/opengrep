@@ -19,13 +19,15 @@ type t = IL.ident
 let normalize_file (file : Fpath.t) : string =
   Fpath.to_string (Fpath.normalize file)
 
+(* Extract position info whenever the token has it, whether the token is
+   real or fake. This keeps same-name functions defined in different files
+   (e.g. class-init or top-level nodes for same-basename files) distinct in
+   the call graph. Upstream's lambda-only specialization would collapse
+   non-lambda fake-token nodes across files. *)
 let key ((id, tok) : t) =
   match Tok.loc_of_tok tok with
   | Ok loc ->
-      let file = loc.pos.file in
-      let line = loc.pos.line in
-      let col = loc.pos.column in
-      (id, normalize_file file, line, col)
+      (id, normalize_file loc.Tok.pos.file, loc.Tok.pos.line, loc.Tok.pos.column)
   | Error _ -> (id, "", 0, 0)
 
 let hash (v : t) = Hashtbl.hash (key v)
@@ -64,8 +66,12 @@ let show_debug (id, tok) : string =
 let of_il_name (n : IL.name) : t =
   n.IL.ident
 
+(* Unlike [key], we don't gate on is_lambda_name here: this is only used for
+   display/serialization, not identity, so extracting position from any fake
+   token that has it is strictly better than returning "unknown". *)
 let to_file_line_col ((_, tok) : t) : string * int * int =
-  match Tok.loc_of_tok tok with
-  | Ok loc ->
-      (normalize_file loc.pos.file, loc.pos.line, loc.pos.column)
-  | Error _ -> ("unknown", 0, 0)
+  if Tok.is_fake tok then
+    match Tok.loc_of_tok tok with
+    | Ok loc -> (normalize_file loc.Tok.pos.file, loc.Tok.pos.line, loc.Tok.pos.column)
+    | _ -> ("unknown", 0, 0)
+  else (normalize_file (Tok.file_of_tok tok), Tok.line_of_tok tok, Tok.col_of_tok tok)
